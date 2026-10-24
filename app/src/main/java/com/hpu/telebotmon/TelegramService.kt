@@ -40,6 +40,17 @@ class TelegramService : Service() {
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
 
+    private val mediaProjectionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1)
+            val data = intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+            val chatId = intent.getStringExtra(EXTRA_CHAT_ID) ?: ""
+            if (resultCode == android.app.Activity.RESULT_OK && data != null) {
+                onMediaProjectionResult(resultCode, data, chatId)
+            }
+        }
+    }
+
     private val http = OkHttpClient.Builder()
         .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
         .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
@@ -52,12 +63,14 @@ class TelegramService : Service() {
         startForeground()
         scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
         loadPrefs()
+        registerReceiver(mediaProjectionReceiver, IntentFilter(ACTION_MEDIA_PROJECTION))
     }
 
     override fun onDestroy() {
         super.onDestroy()
         scope?.cancel()
         cleanupMediaProjection()
+        unregisterReceiver(mediaProjectionReceiver)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
