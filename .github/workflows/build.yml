@@ -19,10 +19,10 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Set up Gradle 8.0
+      - name: Set up Gradle 8.4
         uses: gradle/actions/setup-gradle@v3
         with:
-          gradle-version: '8.0'
+          gradle-version: '8.4'
 
       - name: Download Android SDK cmdline-tools
         shell: bash
