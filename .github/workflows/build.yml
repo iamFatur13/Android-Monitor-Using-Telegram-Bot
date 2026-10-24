@@ -18,18 +18,36 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
-          cache: 'gradle'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          api-level: 34
-          build-tools: 34.0.0
+      - name: Show Android SDK status
+        shell: bash
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls -la "$ANDROID_HOME" 2>/dev/null || echo "no ANDROID_HOME"
+          which sdkmanager || echo "sdkmanager not found"
 
-      - name: Build with Gradle
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+      - name: Install required SDK components
+        shell: bash
+        run: |
+          # Set env if not set
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+
+          # Check & install required packages
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "platform-tools" || echo "SDK install skipped"
+
+      - name: Build APK
+        run: |
+          # Ensure local.properties points to ANDROID_HOME
+          echo "sdk.dir=${{ env.ANDROID_HOME }}" > local.properties || echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
+          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tail -200
 
       - name: Upload APK
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: telebot-monitor-apk
