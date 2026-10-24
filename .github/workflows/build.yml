@@ -48,18 +48,23 @@ jobs:
       - name: Build Debug APK
         shell: bash
         run: |
-          set -o pipefail
-          gradle assembleDebug --no-daemon --stacktrace --info 2>&1 | tee build.log
-
-      - name: Show Kotlin errors on failure
-        if: failure()
-        shell: bash
-        run: |
-          echo "===== Kotlin compile errors ====="
-          grep -E "^(e:|error:|w:|warning:)" build.log || echo "(no e:/w:/error: lines found)"
-          echo ""
-          echo "===== Last 80 lines of build log ====="
-          tail -n 80 build.log
+          gradle clean --no-daemon 2>/dev/null || true
+          gradle assembleDebug --no-daemon --stacktrace --info > build.log 2>&1
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo ""
+            echo "===== BUILD FAILED - Extracting errors ====="
+            echo ""
+            echo "--- Kotlin/Java compile errors ---"
+            grep -E "^(e:|w:|error:|warning:|Caused by:.*Compilation)" build.log 2>/dev/null | head -30 || echo "(no error lines found)"
+            echo ""
+            echo "--- Last 10 completed tasks ---"
+            grep -E "^> Task" build.log | tail -10
+            echo ""
+            echo "--- Last 40 lines of build.log ---"
+            tail -n 40 build.log
+            exit $EXIT_CODE
+          fi
 
       - name: Upload APK
         if: success()
