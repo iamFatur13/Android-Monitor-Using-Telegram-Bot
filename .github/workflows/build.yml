@@ -46,10 +46,31 @@ jobs:
             "platform-tools"
 
       - name: Build Debug APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle assembleDebug --no-daemon --stacktrace --info 2>&1 | tee build.log
+
+      - name: Show Kotlin errors on failure
+        if: failure()
+        shell: bash
+        run: |
+          echo "===== Kotlin compile errors ====="
+          grep -E "^(e:|error:|w:|warning:)" build.log || echo "(no e:/w:/error: lines found)"
+          echo ""
+          echo "===== Last 80 lines of build log ====="
+          tail -n 80 build.log
 
       - name: Upload APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
           path: app/build/outputs/apk/debug/*.apk
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
