@@ -19,6 +19,7 @@ import android.os.Build
 import android.os.IBinder
 import android.util.DisplayMetrics
 import android.view.WindowManager
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -65,6 +66,7 @@ class TelegramService : Service() {
         scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
         loadPrefs()
         registerReceiver(mediaProjectionReceiver, IntentFilter(ACTION_MEDIA_PROJECTION))
+        Log.d(TAG, "onCreate: token=${botToken.take(8)}, chatId=$botChatId")
     }
 
     override fun onDestroy() {
@@ -78,7 +80,7 @@ class TelegramService : Service() {
         botToken = intent?.getStringExtra("token") ?: botToken
         botChatId = intent?.getStringExtra("chatId") ?: botChatId
         savePrefs()
-        if (botToken.isNotEmpty()) startPolling()
+        if (botToken.isNotEmpty()) { Log.d(TAG, "onStartCommand: start polling"); startPolling() } else Log.w(TAG, "onStartCommand: token empty, not polling")
         return START_STICKY
     }
 
@@ -133,11 +135,10 @@ class TelegramService : Service() {
         val resp = withContext(Dispatchers.IO) {
             http.newCall(Request.Builder().url(url).build()).execute()
         }
-        if (!resp.isSuccessful) return
-        val body = resp.body?.string() ?: return
+        if (!resp.isSuccessful) { Log.e(TAG, "pollUpdates: HTTP ${resp.code}"); return }
+        val body = resp.body?.string() ?: run { Log.w(TAG, "pollUpdates: null body"); return }
         val json = JSONObject(body)
-        if (!json.optBoolean("ok", false)) return
-
+        if (!json.optBoolean("ok", false)) { Log.e(TAG, "pollUpdates: TG not ok: " + body.take(200)); return }
         val arr = json.getJSONArray("result")
         for (i in 0 until arr.length()) {
             val obj = arr.getJSONObject(i)
@@ -145,9 +146,11 @@ class TelegramService : Service() {
             val msg = obj.optJSONObject("message") ?: continue
             val text = msg.optString("text", "")
             val thisChatId = msg.optJSONObject("chat")?.optLong("id")?.toString() ?: ""
-            if (botChatId.isNotEmpty() && thisChatId != botChatId) continue
+            if (botChatId.isNotEmpty() && thisChatId != botChatId) { Log.d(TAG, "msg from $thisChatId ignored (filter=$botChatId)"); continue }
+            Log.d(TAG, "COMMAND: \"$text\" from $thisChatId")
             handleCommand(text.trim(), thisChatId)
         }
+        Log.d(TAG, "pollUpdates: done, lastUpdateId=$lastUpdateId")
     }
 
     private suspend fun handleCommand(text: String, targetChatId: String) {
@@ -331,6 +334,7 @@ class TelegramService : Service() {
     }
 
     companion object {
+        const val TAG = "TeleBotService"
         const val ACTION_MEDIA_PROJECTION = "com.hpu.telebotmon.MEDIA_PROJECTION"
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
