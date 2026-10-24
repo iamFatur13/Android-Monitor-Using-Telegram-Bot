@@ -13,42 +13,50 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
+          cache: 'maven'
 
-      - name: Show Android SDK status
+      - name: Show environment
         shell: bash
         run: |
+          echo "JAVA_HOME=$JAVA_HOME"
+          echo "JAVA_VERSION: $(java -version 2>&1 | head -1)"
           echo "ANDROID_HOME=$ANDROID_HOME"
-          ls -la "$ANDROID_HOME" 2>/dev/null || echo "no ANDROID_HOME"
-          which sdkmanager || echo "sdkmanager not found"
+          echo "Gradle files:"
+          ls -la app/build.gradle settings.gradle build.gradle gradle.properties
+          echo "SDK content:"
+          ls -la "$ANDROID_HOME" 2>/dev/null || echo "ANDROID_HOME empty"
 
-      - name: Install required SDK components
+      - name: Generate gradle wrapper
         shell: bash
         run: |
-          # Set env if not set
           export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
-          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          gradle --version || echo "gradle not available"
 
-          # Check & install required packages
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            "platforms;android-34" \
-            "build-tools;34.0.0" \
-            "platform-tools" || echo "SDK install skipped"
-
-      - name: Build APK
+      - name: Build Debug APK
+        shell: bash
         run: |
-          # Ensure local.properties points to ANDROID_HOME
-          echo "sdk.dir=${{ env.ANDROID_HOME }}" > local.properties || echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
-          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tail -200
+          set -e
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          export PATH="$ANDROID_HOME/tools:$ANDROID_HOME/tools/bin:$ANDROID_HOME/platform-tools:$PATH"
+          
+          # Create local.properties if needed
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          
+          # Run gradle
+          echo "Running gradle assembleDebug..."
+          gradle assembleDebug --no-daemon --refresh-dependencies --stacktrace
+          
+          echo "Build complete, checking output..."
+          ls -la app/build/outputs/apk/debug/ || echo "No output folder"
 
       - name: Upload APK
-        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: telebot-monitor-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: app-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: ignore
