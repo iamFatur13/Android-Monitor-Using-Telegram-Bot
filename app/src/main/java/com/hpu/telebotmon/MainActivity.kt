@@ -53,10 +53,10 @@ class MainActivity : AppCompatActivity() {
                     val chatId = etChatId.text.toString().trim()
                     if (chatId.isNotEmpty()) {
                         notifyServiceMediaProjection(Activity.RESULT_OK, data, chatId)
-                        Toast.makeText(this, "✅ Izin tangkap layar diberikan", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(this, "Izin tangkap layar diberikan", Toast.LENGTH_SHORT).show()
                     }
                 }
-                else -> Toast.makeText(this, "❌ Izin tangkap layar ditolak", Toast.LENGTH_SHORT).show()
+                else -> Toast.makeText(this, "Izin tangkap layar ditolak", Toast.LENGTH_SHORT).show()
             }
         }
 
@@ -78,10 +78,10 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     startService(svc)
                 }
-                Toast.makeText(this, "Service dimulai", Toast.LENGTH.SHORT).show()
+                Toast.makeText(this, "Service dimulai", Toast.LENGTH_SHORT).show()
             } else {
                 stopService(Intent(this, TelegramService::class.java))
-                Toast.makeText(this, "Service dihentikan", Toast.LENGTH.SHORT).show()
+                Toast.makeText(this, "Service dihentikan", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -96,7 +96,7 @@ class MainActivity : AppCompatActivity() {
     private fun testConnection() {
         val token = etToken.text.toString().trim()
         if (token.isEmpty()) {
-            Toast.makeText(this, "Masukkan token bot", Toast.LENGTH.SHORT).show()
+            Toast.makeText(this, "Masukkan token bot", Toast.LENGTH_SHORT).show()
             return
         }
         try {
@@ -108,12 +108,12 @@ class MainActivity : AppCompatActivity() {
             if (response.contains("\"ok\":true")) {
                 val json = org.json.JSONObject(response)
                 val botName = json.getJSONObject("result").optString("first_name", "unknown")
-                Toast.makeText(this, "✅ Terhubung ke @$botName", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "Terhubung ke @$botName", Toast.LENGTH_LONG).show()
             } else {
-                Toast.makeText(this, "❌ Token tidak valid", Toast.LENGTH.SHORT).show()
+                Toast.makeText(this, "Token tidak valid", Toast.LENGTH_SHORT).show()
             }
         } catch (e: Exception) {
-            Toast.makeText(this, "❌ Error: ${e.message}", Toast.LENGTH.SHORT).show()
+            Toast.makeText(this, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }
 
