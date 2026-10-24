@@ -225,8 +225,7 @@ class TelegramService : Service() {
         val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 1)
         val pct = if (level > 0 && scale > 0) level * 100 / scale else 0
         val status = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
-        val charging = status == android.os.BatteryManager.STATUS_CHARGING || 
-                      status == android.os.BatteryManager.STATUS_FULL
+        val charging = status == 2 || status == 5 // BatteryManager.STATUS_CHARGING, STATUS_FULL
         return Pair(pct, charging)
     }
 
