@@ -7,7 +7,9 @@ import android.content.SharedPreferences
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
+import android.util.Log
 import android.widget.Button
 import android.widget.EditText
 import android.widget.Switch
@@ -54,6 +56,51 @@ class MainActivity : AppCompatActivity() {
         etToken.setText(prefs.getString("token", ""))
         etChatId.setText(prefs.getString("chat_id", ""))
 
+        // PENTING: persist state toggle ke prefs, dan set switch ke state terakhir
+        // sebelum attach listener, agar tidak memicu stopService saat recreate
+        val serviceWasOn = prefs.getBoolean("service_enabled", false)
+        switchService.setOnCheckedChangeListener(null) // lepas dulu listener-nya
+        switchService.isChecked = serviceWasOn
+        switchService.setOnCheckedChangeListener { _, isChecked ->
+            prefs.edit().putBoolean("service_enabled", isChecked).apply()
+            savePrefs()
+            if (isChecked) {
+                if (etToken.text.isNullOrBlank()) {
+                    Toast.makeText(this, "Masukkan token bot terlebih dahulu", Toast.LENGTH_SHORT).show()
+                    switchService.isChecked = false
+                    prefs.edit().putBoolean("service_enabled", false).apply()
+                    return@setOnCheckedChangeListener
+                }
+                val svc = Intent(this, TelegramService::class.java)
+                svc.putExtra("token", etToken.text.toString().trim())
+                svc.putExtra("chatId", etChatId.text.toString().trim())
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(svc)
+                } else {
+                    startService(svc)
+                }
+                Toast.makeText(this, "Service dimulai (tahan di background)", Toast.LENGTH_SHORT).show()
+            } else {
+                stopService(Intent(this, TelegramService::class.java))
+                Toast.makeText(this, "Service dihentikan", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        // Kalau service terakhir ON, restart otomatis saat app dibuka
+        val savedToken = prefs.getString("token", "") ?: ""
+        val savedChatId = prefs.getString("chat_id", "") ?: ""
+        if (serviceWasOn && savedToken.isNotEmpty()) {
+            Log.d(TAG, "MainActivity: auto-restart service (service_was_on=true)")
+            val svc = Intent(this, TelegramService::class.java)
+            svc.putExtra("token", savedToken.trim())
+            svc.putExtra("chatId", savedChatId.trim())
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(svc)
+            } else {
+                startService(svc)
+            }
+        }
+
         // MediaProjection result launcher
         mediaProjectionLauncher = registerForActivityResult(
             ActivityResultContracts.StartActivityForResult()
@@ -74,28 +121,6 @@ class MainActivity : AppCompatActivity() {
         btnTest.setOnClickListener { testConnection() }
         btnGrantScreenshot.setOnClickListener { requestScreenshotPermission() }
         btnGrantNotif.setOnClickListener { requestNotificationAccess() }
-        switchService.setOnCheckedChangeListener { _, isChecked ->
-            savePrefs()
-            if (isChecked) {
-                if (etToken.text.isNullOrBlank()) {
-                    Toast.makeText(this, "Masukkan token bot terlebih dahulu", Toast.LENGTH_SHORT).show()
-                    switchService.isChecked = false
-                    return@setOnCheckedChangeListener
-                }
-                val svc = Intent(this, TelegramService::class.java)
-                svc.putExtra("token", etToken.text.toString().trim())
-                svc.putExtra("chatId", etChatId.text.toString().trim())
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    startForegroundService(svc)
-                } else {
-                    startService(svc)
-                }
-                Toast.makeText(this, "Service dimulai", Toast.LENGTH_SHORT).show()
-            } else {
-                stopService(Intent(this, TelegramService::class.java))
-                Toast.makeText(this, "Service dihentikan", Toast.LENGTH_SHORT).show()
-            }
-        }
     }
 
     private fun savePrefs() {
@@ -221,5 +246,9 @@ class MainActivity : AppCompatActivity() {
         act.putExtra(TelegramService.EXTRA_RESULT_DATA, data)
         act.putExtra(TelegramService.EXTRA_CHAT_ID, chatId)
         sendBroadcast(act)
+    }
+
+    companion object {
+        private const val TAG = "TeleBotMain"
     }
 }

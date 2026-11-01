@@ -79,6 +79,14 @@ Kamu akan lihat:
 - GitHub Actions: push ke main → APK auto-build → download dari Actions/Artifacts
 - Lokal: `./gradlew assembleDebug` (hasil di `app/build/outputs/apk/debug/app-debug.apk`)
 
+## Persistensi Service (toggle tidak mati sendiri)
+Toggle service di-persist ke `SharedPreferences` key `service_enabled`. Efek:
+- Saat app dibuka ulang, toggle otomatis kembali ke state terakhir (ON tetap ON).
+- Jika state terakhir ON, service di-start ulang otomatis di `MainActivity.onCreate()`.
+- `BootReceiver` mendaftarkan `BOOT_COMPLETED` + `QUICKBOOT_POWERON` — setelah HP reboot, service auto-restart tanpa perlu buka app (asalkan user terakhir kali menyalakannya).
+
+Untuk menonaktifkan permanen: matikan toggle di app (state disimpan `false`), atau uninstall.
+
 ## Persyaratan
 - Android 7.0+ (API 24)
 - Target: API 34
