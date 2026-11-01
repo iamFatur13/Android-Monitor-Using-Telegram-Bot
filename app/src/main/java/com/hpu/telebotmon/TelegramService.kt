@@ -142,14 +142,18 @@ class TelegramService : Service() {
     private fun startPolling() {
         scope?.launch {
             Log.d(TAG, "startPolling: loop started, lastUpdateId=$lastUpdateId")
+            // Reset lastUpdateId untuk fetch update terbaru (bukan yang sudah di-consuming)
+            // Kalau tidak reset, getUpdates dengan offset terlalu jauh akan kosong
+            lastUpdateId = 0L
+            Log.d(TAG, "startPolling: reset lastUpdateId to 0, will fetch from current")
             while (isActive) {
                 try {
                     pollUpdates()
                     Log.d(TAG, "pollUpdates: success, delaying 2s")
                     delay(2000L)
-                } catch (e: CancellationException) { 
+                } catch (e: CancellationException) {
                     Log.d(TAG, "polling cancelled")
-                    throw e 
+                    throw e
                 }
                 catch (e: Exception) {
                     Log.e(TAG, "polling loop error: ${e.javaClass.simpleName}: ${e.message}")
@@ -170,8 +174,15 @@ class TelegramService : Service() {
             if (lastUpdateId > 0) append("&offset=").append(lastUpdateId + 1)
         }
         Log.d(TAG, "pollUpdates: GET $url")
-        val resp = withContext(Dispatchers.IO) {
-            http.newCall(Request.Builder().url(url).build()).execute()
+        var resp: okhttp3.Response
+        try {
+            resp = withContext(Dispatchers.IO) {
+                http.newCall(Request.Builder().url(url).build()).execute()
+            }
+        } catch (e: Exception) {
+            // OkHttp timeout / IO error → jangan bunuh polling loop, log & retry
+            Log.e(TAG, "pollUpdates: HTTP request failed: ${e.javaClass.simpleName}: ${e.message}")
+            return
         }
         if (!resp.isSuccessful) { 
             Log.e(TAG, "pollUpdates: HTTP ${resp.code}")
@@ -195,6 +206,7 @@ class TelegramService : Service() {
             val msg = obj.optJSONObject("message") ?: continue
             val text = msg.optString("text", "")
             val thisChatId = msg.optJSONObject("chat")?.optLong("id")?.toString() ?: ""
+            // Jika botChatId diisi, reply ke sana. Jika kosong, reply ke chat asal (biar /diag & /help masih berfungsi)
             val target = if (botChatId.isNotEmpty()) botChatId else thisChatId
             Log.d(TAG, "COMMAND: \"$text\" from $thisChatId -> reply to $target (update_id: $oldUpdateId -> $lastUpdateId)")
             handleCommand(text.trim(), target)
@@ -238,6 +250,34 @@ class TelegramService : Service() {
                 } else {
                     sendText(targetChatId, "⚠️ Monitor notifikasi belum diizinkan.\nBuka app → tap \"Izinkan Monitor Notifikasi\" → centang app → kembali. Lalu /notifications lagi.")
                 }
+            }
+            cmd.contains("/reset") || cmd == "reset" -> {
+                // Debug: reset lastUpdateId + restart polling
+                lastUpdateId = 0L
+                Log.d(TAG, "/reset: lastUpdateId reset to 0")
+                sendText(targetChatId, "✅ lastUpdateId di-reset ke 0. Polling restart, coba /ping lagi.")
+            }
+            cmd.contains("/diag") || cmd == "diag" -> {
+                // Diagnostik: cek status polling & kirim getMe + getUpdates mentah
+                val sb = StringBuilder()
+                sb.append("DIAGNOSTIK:\n")
+                sb.append("token: ").append(if (botToken.isNotEmpty()) botToken.take(8) + "..." + botToken.takeLast(4) else "(KOSONG)").append("\n")
+                sb.append("chatId: ").append(if (botChatId.isNotEmpty()) botChatId else "(KOSONG)").append("\n")
+                sb.append("lastUpdateId: ").append(lastUpdateId).append("\n")
+                sb.append("Build: ").append(Build.MODEL).append("\n")
+                try {
+                    val diag = withContext(Dispatchers.IO) {
+                        http.newCall(
+                            Request.Builder()
+                                .url("https://api.telegram.org/bot$botToken/getMe")
+                                .build()
+                        ).execute().body?.string() ?: "null"
+                    }
+                    sb.append("getMe: ").append(diag.take(200)).append("\n")
+                } catch (e: Exception) {
+                    sb.append("getMe GAGAL: ").append(e.message).append("\n")
+                }
+                sendText(targetChatId, sb.toString())
             }
             else -> {
                 sendText(targetChatId, "Perintah tidak dikenal. Ketik /help untuk bantuan.")
