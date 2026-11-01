@@ -76,6 +76,22 @@
             android:layout_marginTop="16dp"
             android:text="Izinkan Tangkap Layar (Overlay)" />
 
+        <Button
+            android:id="@+id/btn_grant_notif"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Izinkan Monitor Notifikasi" />
+
+        <TextView
+            android:id="@+id/tv_notif_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="Status monitor notifikasi: belum diizinkan"
+            android:textColor="@color/accent"
+            android:textSize="13sp" />
+
         <ProgressBar
             android:id="@+id/progress"
             android:layout_width="wrap_content"

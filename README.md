@@ -8,6 +8,7 @@ Aplikasi Android yang dapat dikendalikan melalui Telegram Bot.
 - 📍 Lokasi GPS
 - 🔋 Cek level baterai
 - 📊 Info perangkat
+- 🔔 Monitor notifikasi — semua notifikasi masuk otomatis dikirim ke chat bot
 - ⚡ Foreground service (tahan di background)
 - 📝 Monitoring logcat (semua perintah & error ter-log di tag `TeleBotService`)
 
@@ -21,7 +22,24 @@ Aplikasi Android yang dapat dikendalikan melalui Telegram Bot.
 | `/battery` | Level baterai |
 | `/status` | Info perangkat |
 | `/gps` | Lokasi GPS terakhir + link Google Maps |
+| `/notifications` | Cek status monitor notifikasi |
 | `/help` | Daftar perintah |
+
+## Monitor Notifikasi
+Semua notifikasi yang masuk (WhatsApp, SMS, email, app lain) otomatis dikirim ke chat bot dengan format:
+```
+🔔 [10:35:12] example.app
+Judul: Pesan baru
+Teks: Halo
+App: com.example.app
+```
+**Cara aktifkan:**
+1. Buka app → tap "Izinkan Monitor Notifikasi"
+2. Di halaman Settings yang muncul, centang **TeleBot Monitor**
+3. Kembali ke app — status berubah jadi "✅ Monitor notifikasi AKTIF"
+4. (Opsional) Ketik `/notifications` di Telegram untuk verifikasi
+
+Notifikasi akan masuk terus selama app terinstall & izin tidak dicabut.
 
 ## Cara Pakai
 
@@ -69,8 +87,9 @@ Kamu akan lihat:
 ## Struktur
 ```
 app/src/main/java/com/hpu/telebotmon/
-├── MainActivity.kt              (UI utama + permintaan izin)
+├── MainActivity.kt              (UI utama + permintaan izin + tombol notif)
 ├── TelegramService.kt           (Foreground service: polling, perintah, kirim foto/GPS)
+├── NotificationWatcherService.kt(Notification listener: kirim semua notifikasi ke bot)
 ├── PermissionLauncherActivity.kt(Launcher izin lokasi dari service)
 └── App.kt                       (Application)
 ```
@@ -86,6 +105,7 @@ app/src/main/java/com/hpu/telebotmon/
 | ACCESS_COARSE/FINE_LOCATION | `/gps` |
 | READ_EXTERNAL_STORAGE (≤ API 32) | `/photo` (galeri) |
 | READ_MEDIA_IMAGES (API 33+) | `/photo` (galeri) |
+| BIND_NOTIFICATION_LISTENER_SERVICE | Monitor notifikasi |
 
 ## Catatan
 - `getUpdates` memakai `timeout=0` (non-blocking, poll tiap 2 detik) agar OkHttp read-timeout 30s tidak sempat ke-jadi masalah.

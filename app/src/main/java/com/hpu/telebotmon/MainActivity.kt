@@ -11,10 +11,12 @@ import android.provider.Settings
 import android.widget.Button
 import android.widget.EditText
 import android.widget.Switch
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.NotificationManagerCompat
 
 class MainActivity : AppCompatActivity() {
 
@@ -22,6 +24,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etChatId: EditText
     private lateinit var btnTest: Button
     private lateinit var btnGrantScreenshot: Button
+    private lateinit var btnGrantNotif: Button
+    private lateinit var tvNotifStatus: TextView
     private lateinit var switchService: Switch
 
     private lateinit var prefs: SharedPreferences
@@ -42,6 +46,8 @@ class MainActivity : AppCompatActivity() {
         etChatId = findViewById(R.id.et_chat_id)
         btnTest = findViewById(R.id.btn_test)
         btnGrantScreenshot = findViewById(R.id.btn_grant_screenshot)
+        btnGrantNotif = findViewById(R.id.btn_grant_notif)
+        tvNotifStatus = findViewById(R.id.tv_notif_status)
         switchService = findViewById(R.id.switch_service)
 
         // Load saved values
@@ -67,6 +73,7 @@ class MainActivity : AppCompatActivity() {
 
         btnTest.setOnClickListener { testConnection() }
         btnGrantScreenshot.setOnClickListener { requestScreenshotPermission() }
+        btnGrantNotif.setOnClickListener { requestNotificationAccess() }
         switchService.setOnCheckedChangeListener { _, isChecked ->
             savePrefs()
             if (isChecked) {
@@ -120,6 +127,26 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             Toast.makeText(this, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshNotifStatus()
+    }
+
+    private fun refreshNotifStatus() {
+        val enabled = NotificationWatcherService.isEnabled(this)
+        tvNotifStatus.text = if (enabled) {
+            "✅ Monitor notifikasi AKTIF — semua notifikasi masuk dikirim ke bot"
+        } else {
+            "Status monitor notifikasi: belum diizinkan (tap tombol di atas)"
+        }
+    }
+
+    private fun requestNotificationAccess() {
+        val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+        startActivity(intent)
+        Toast.makeText(this, "Centang app ini di daftar Notification Access", Toast.LENGTH_LONG).show()
     }
 
     private fun requestScreenshotPermission() {
