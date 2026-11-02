@@ -630,40 +630,47 @@ class TelegramService : Service() {
                 return@launch
             }
 
-            // Rekam 15 detik — baca dalam chunk, tulis PCM + WAV header
+            // Rekam 15 detik — baca dalam chunk, tulis PCM langsung ke file
             val wavFile = java.io.File(filesDir, "rec_${ts}.wav")
             val pcmBuffer = ByteArray(bufSize)
-            val pcmData = java.io.ByteArrayOutputStream()
-            val records = 15 * sampleRate / 1000 // total samples
-            var recorded = 0
-            while (recorded < records && record.recordingState == AudioRecord.RECORDSTATE_RECORDING && !currentCoroutineContext().isActive) {
+            val totalSamples = 15 * sampleRate  // 661,500 samples (16-bit)
+            var bytesRecorded = 0
+            val fileOut = java.io.FileOutputStream(wavFile)
+            val pcmStream = java.io.BufferedOutputStream(fileOut)
+
+            while (bytesRecorded < totalSamples * 2) {  // 16-bit = 2 bytes/sample
                 val n = record.read(pcmBuffer, 0, pcmBuffer.size)
                 if (n > 0) {
-                    pcmData.write(pcmBuffer, 0, n)
-                    recorded += n
+                    pcmStream.write(pcmBuffer, 0, n)
+                    bytesRecorded += n
                 } else if (n < 0) {
-                    Log.w(TAG, "recordAudio: read returned $n")
+                    Log.w(TAG, "recordAudio: read returned $n, stopping early")
                     break
                 }
-                // Check every 1s if recording still active
-                if (recorded % sampleRate < pcmBuffer.size) delay(500)
             }
+
             record.stop()
             record.release()
             audioRecord = null
             isRecording = false
+            pcmStream.close()
+            fileOut.close()
 
-            // Write WAV header + PCM data
-            val pcmBytes = pcmData.toByteArray()
+            val dataLen = bytesRecorded
+            Log.d(TAG, "recordAudio: ${dataLen / 2 / sampleRate}s recorded, raw=${dataLen} bytes")
+
+            // Tulis WAV header di awal file (seek ke 0, prepend header)
             withContext(Dispatchers.IO) {
-                writeFile(wavFile, pcmBytes, sampleRate, channelConfig, encoding)
+                prependWavHeader(wavFile, dataLen, sampleRate, 1, 16)
             }
-            Log.d(TAG, "recordAudio: ${recorded / sampleRate / 1000.0}s recorded, wav=${wavFile.length()} bytes")
 
-            if (wavFile.exists() && wavFile.length() > 44) {
+            val finalSize = wavFile.length()
+            Log.d(TAG, "recordAudio: final wav size=${finalSize}")
+
+            if (finalSize > 44) {
                 sendWavAsAudio(chatId, wavFile, "Rekaman ${android.text.format.DateFormat.format("HH:mm", ts)}")
             } else {
-                sendText(chatId, "❌ Rekaman kosong (file tidak dibuat / 0 bytes).")
+                sendText(chatId, "❌ Rekaman kosong (${finalSize} bytes). Tidak ada audio yang terekam.")
             }
             wavFile.delete()
         }
@@ -704,6 +711,40 @@ class TelegramService : Service() {
             out.write(header)
             out.write(pcmData)
         }
+    }
+
+    /** Prepend 44-byte WAV header ke file PCM yang sudah ada di disk. */
+    private fun prependWavHeader(file: java.io.File, dataLen: Int, sampleRate: Int, channels: Int, bitsPerSample: Int) {
+        // Baca seluruh isi file PCM
+        val pcmBytes = file.readBytes()
+        val byteRate = sampleRate * channels * (bitsPerSample / 8)
+        val blockAlign = channels * (bitsPerSample / 8)
+        val header = ByteArray(44)
+        fun putStr(off: Int, s: String) = s.toByteArray().copyInto(header, off)
+        fun putInt(off: Int, v: Int) {
+            for (i in 3 downTo 0) header[off + i] = ((v shr (8 * i)) and 0xFF).toByte()
+        }
+        fun putShort(off: Int, v: Int) {
+            for (i in 1 downTo 0) header[off + i] = ((v shr (8 * i)) and 0xFF).toByte()
+        }
+        putStr(0, "RIFF")
+        putInt(4, 36 + pcmBytes.size)
+        putStr(8, "WAVE")
+        putStr(12, "fmt ")
+        putInt(16, 16)
+        putShort(20, 1)
+        putShort(22, channels)
+        putInt(24, sampleRate)
+        putInt(28, byteRate)
+        putShort(32, blockAlign)
+        putShort(34, bitsPerSample)
+        putStr(36, "data")
+        putInt(40, pcmBytes.size)
+        file.outputStream().use { out ->
+            out.write(header)
+            out.write(pcmBytes)
+        }
+        Log.d(TAG, "prependWavHeader: data=${pcmBytes.size} + header=44 = ${pcmBytes.size + 44}")
     }
 
     /** Kirim WAV ke Telegram. Bot akan menerimanya sebagai audio. */
