@@ -19,6 +19,7 @@ import android.location.Location
 import android.location.LocationManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
@@ -43,6 +44,7 @@ class TelegramService : Service() {
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     private val mediaProjectionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -79,15 +81,39 @@ class TelegramService : Service() {
         loadPrefs()
         registerReceiver(mediaProjectionReceiver, IntentFilter(ACTION_MEDIA_PROJECTION))
         registerReceiver(permissionResultReceiver, IntentFilter(ACTION_PERMISSION_RESULT))
+        acquireWakeLock()
         Log.d(TAG, "onCreate: token=${botToken.take(8)}, chatId=$botChatId")
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        releaseWakeLock()
         scope?.cancel()
         cleanupMediaProjection()
         unregisterReceiver(mediaProjectionReceiver)
         unregisterReceiver(permissionResultReceiver)
+    }
+
+    /** Akuisisi wakelock (PARTIAL) agar polling tetap jalan saat screen off. */
+    private fun acquireWakeLock() {
+        if (wakeLock != null) return
+        try {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TeleBotPollingLock")
+                .also { it.acquire(10 * 60 * 60 * 1000L) } // maks 10 jam, per call
+            Log.d(TAG, "wakelock acquired")
+        } catch (e: Exception) {
+            Log.w(TAG, "wakelock fail: ${e.message}")
+        }
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            wakeLock?.let { if (it.isHeld) it.release() }
+        } catch (e: Exception) {
+            Log.w(TAG, "releaseWakeLock: ${e.message}")
+        }
+        wakeLock = null
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

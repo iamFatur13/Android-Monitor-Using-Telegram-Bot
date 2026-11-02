@@ -19,7 +19,6 @@ import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.NotificationManagerCompat
-
 class MainActivity : AppCompatActivity() {
 
     private lateinit var etToken: EditText
@@ -79,6 +78,8 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     startService(svc)
                 }
+                // Sekali-sekali, minta exempt dari battery optimization
+                requestBatteryOptimizationExempt()
                 Toast.makeText(this, "Service dimulai (tahan di background)", Toast.LENGTH_SHORT).show()
             } else {
                 stopService(Intent(this, TelegramService::class.java))
@@ -157,6 +158,35 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         refreshNotifStatus()
+    }
+
+    /**
+     * Minta exempt dari battery optimization (khusus Android 6+).
+     * Kalau MIUI, user juga perlu set "Auto-launch: ON" + "Background activity: Allowed"
+     * di Settings → Apps → Manage apps → TeleBot Monitor.
+     */
+    private fun requestBatteryOptimizationExempt() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) {
+            Log.d(TAG, "Battery optimization already exempt")
+            return
+        }
+        try {
+            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                .setData(android.net.Uri.parse("package:$packageName"))
+            startActivity(intent)
+        } catch (e: Exception) {
+            // Beberapa device tidak punya action ini, fallback ke page settings
+            try {
+                startActivity(
+                    Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                )
+                Toast.makeText(this, "Matikan battery optimization untuk app ini", Toast.LENGTH_LONG).show()
+            } catch (e2: Exception) {
+                Log.w(TAG, "Cannot open battery settings: ${e2.message}")
+            }
+        }
     }
 
     private fun refreshNotifStatus() {
