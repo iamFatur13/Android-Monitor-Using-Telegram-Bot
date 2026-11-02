@@ -38,6 +38,7 @@ class TelegramService : Service() {
 
     private var scope: CoroutineScope? = null
     private var lastUpdateId = 0L
+    private var isPolling = false
     var botToken: String = ""
     var botChatId: String = ""
 
@@ -121,17 +122,23 @@ class TelegramService : Service() {
         botChatId = intent?.getStringExtra("chatId") ?: botChatId
         savePrefs()
         if (botToken.isNotEmpty()) {
-            Log.d(TAG, "onStartCommand: start polling")
-            startPolling()
-            // Konfirmasi ke chat Telegram bahwa service aktif
-            if (botChatId.isNotEmpty()) {
+            Log.d(TAG, "onStartCommand: polling already running? scope=${scope?.isActive}")
+            // Kirim konfirmasi HANYA saat service benar-benar baru (intent membawa token),
+            // bukan saat sistem auto-restart via START_STICKY (intent=null).
+            // Ini mencegah spam "✅ TeleBot aktif..." setiap kali service di-recreate.
+            val isFreshStart = intent?.hasExtra("token") == true
+            if (isFreshStart && botChatId.isNotEmpty()) {
+                Log.d(TAG, "onStartCommand: fresh start, send confirmation")
                 scope?.launch {
                     sendText(botChatId, "✅ TeleBot aktif di ${Build.MODEL}. Ketik /help untuk daftar perintah.")
                 }
             } else {
-                Log.w(TAG, "onStartCommand: chatId kosong, tidak bisa kirim konfirmasi")
+                Log.d(TAG, "onStartCommand: sticky restart (no new token), skip confirmation")
             }
-        } else Log.w(TAG, "onStartCommand: token empty, not polling")
+            startPolling()
+        } else {
+            Log.w(TAG, "onStartCommand: token empty, not polling")
+        }
         return START_STICKY
     }
 
@@ -166,12 +173,17 @@ class TelegramService : Service() {
     }
 
     private fun startPolling() {
+        if (isPolling) {
+            Log.d(TAG, "startPolling: already running, skip duplicate")
+            return
+        }
+        isPolling = true
         scope?.launch {
-            Log.d(TAG, "startPolling: loop started, lastUpdateId=$lastUpdateId")
-            // Reset lastUpdateId untuk fetch update terbaru (bukan yang sudah di-consuming)
-            // Kalau tidak reset, getUpdates dengan offset terlalu jauh akan kosong
-            lastUpdateId = 0L
-            Log.d(TAG, "startPolling: reset lastUpdateId to 0, will fetch from current")
+            // Pulihkan lastUpdateId dari prefs (bukan selalu reset ke 0)
+            // supaya service recreate (START_STICKY / MIUI kill) tidak
+            // re-fetch update lama yang sudah di-consume.
+            lastUpdateId = prefs().getLong("last_update_id", 0L)
+            Log.d(TAG, "startPolling: loop started, lastUpdateId=$lastUpdateId (restored from prefs)")
             while (isActive) {
                 try {
                     pollUpdates()
@@ -237,6 +249,10 @@ class TelegramService : Service() {
             Log.d(TAG, "COMMAND: \"$text\" from $thisChatId -> reply to $target (update_id: $oldUpdateId -> $lastUpdateId)")
             handleCommand(text.trim(), target)
         }
+        // Persist lastUpdateId supaya tidak re-fetch update lama saat service di-recreate
+        if (lastUpdateId > 0) {
+            prefs().edit().putLong("last_update_id", lastUpdateId).apply()
+        }
         Log.d(TAG, "pollUpdates: done, lastUpdateId=$lastUpdateId")
     }
 
@@ -278,9 +294,10 @@ class TelegramService : Service() {
                 }
             }
             cmd.contains("/reset") || cmd == "reset" -> {
-                // Debug: reset lastUpdateId + restart polling
+                // Debug: reset lastUpdateId + clear di prefs
                 lastUpdateId = 0L
-                Log.d(TAG, "/reset: lastUpdateId reset to 0")
+                prefs().edit().putLong("last_update_id", 0L).apply()
+                Log.d(TAG, "/reset: lastUpdateId reset to 0 (in-memory + prefs)")
                 sendText(targetChatId, "✅ lastUpdateId di-reset ke 0. Polling restart, coba /ping lagi.")
             }
             cmd.contains("/diag") || cmd == "diag" -> {
