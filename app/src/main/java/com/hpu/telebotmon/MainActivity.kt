@@ -42,6 +42,8 @@ class MainActivity : AppCompatActivity() {
         requestLocationPermission()
         // Minta izin akses galeri (untuk fitur /photo)
         requestGalleryPermission()
+        // Minta izin mikrofon (untuk fitur /record)
+        requestAudioPermission()
 
         etToken = findViewById(R.id.et_token)
         etChatId = findViewById(R.id.et_chat_id)
@@ -246,6 +248,14 @@ class MainActivity : AppCompatActivity() {
         requestPermissions(arrayOf(perm), 1002)
     }
 
+    /** Minta izin mikrofon (untuk fitur /record). */
+    private fun requestAudioPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED) return
+        requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO), 1003)
+    }
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<out String>,
@@ -265,6 +275,14 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(
                 this,
                 if (granted) "Izin akses galeri diberikan" else "Izin galeri ditolak — fitur /photo tidak akan bekerja",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+        if (requestCode == 1003) {
+            val granted = grantResults.all { it == android.content.pm.PackageManager.PERMISSION_GRANTED }
+            Toast.makeText(
+                this,
+                if (granted) "Izin mikrofon diberikan" else "Izin mikrofon ditolak — fitur /record tidak akan bekerja",
                 Toast.LENGTH_LONG
             ).show()
         }
