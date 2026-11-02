@@ -580,23 +580,35 @@ class TelegramService : Service() {
         }
         val ts = System.currentTimeMillis()
         val outFile = java.io.File(filesDir, "rec_${ts}.m4a")
+        // Hapus file lama yang mungkin tertinggal (membuat start() gagal)
+        if (outFile.exists()) outFile.delete()
+
         val recorder = createRecorder(outFile)
         mediaRecorder = recorder
         isRecording = true
         sendText(chatId, "⏺️ Mulai rekam 15 detik...")
         scope?.launch {
+            var startError: String? = null
             try {
+                recorder.prepare()
                 recorder.start()
                 Log.d(TAG, "recordAudio: started OK, file=${outFile.absolutePath}")
             } catch (e: Exception) {
-                Log.e(TAG, "recordAudio: start failed: ${e.javaClass.simpleName}: ${e.message}")
-                stopRecording()
-                sendText(chatId, "Gagal mulai rekam. Error: ${e.javaClass.simpleName} - ${e.message ?: "(null)"}\nCoba /diag untuk info tambahan.")
+                startError = "${e.javaClass.simpleName}: ${e.message ?: "(null)"}\nStack: ${e.stackTraceToString().lineSequence().take(3).joinToString("\n")}"
+                Log.e(TAG, "recordAudio: start failed: $startError")
+            }
+            stopRecording()
+            if (startError != null) {
+                sendText(chatId, "❌ Gagal mulai rekam. Detail:\n$startError")
                 return@launch
             }
             delay(15_000L)
             stopRecording()
-            sendAudio(chatId, outFile, "Rekaman ${android.text.format.DateFormat.format("HH:mm", ts)}")
+            if (outFile.exists() && outFile.length() > 0) {
+                sendAudio(chatId, outFile, "Rekaman ${android.text.format.DateFormat.format("HH:mm", ts)}")
+            } else {
+                sendText(chatId, "❌ Rekaman kosong (file tidak dibuat).")
+            }
         }
     }
 
