@@ -110,12 +110,18 @@ class NotificationWatcherService : NotificationListenerService() {
     /** Cek apakah listener service ini sudah diaktifkan user. */
     companion object {
         const val TAG = "NotifWatcher"
-        fun isEnabled(context: Context): Boolean {
-            val cn = ComponentName(context, NotificationWatcherService::class.java)
-            val enabled =
-                androidx.core.app.NotificationManagerCompat.getEnabledListenerPackages(context)
-            return enabled.contains(cn.packageName)
-        }
+
+        /**
+         * Kembalikan false saat service dinonaktifkan (untuk isolasi crash).
+         * Ubah ke [enabledFromSystem] bila sudah diaktifkan kembali.
+         */
+        fun isEnabled(context: Context): Boolean = false
+        // private fun enabledFromSystem(context: Context): Boolean {
+        //     val cn = ComponentName(context, NotificationWatcherService::class.java)
+        //     val enabled =
+        //         androidx.core.app.NotificationManagerCompat.getEnabledListenerPackages(context)
+        //     return enabled.contains(cn.packageName)
+        // }
     }
 }
 

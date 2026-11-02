@@ -285,13 +285,7 @@ class TelegramService : Service() {
                 sendHelp(targetChatId)
             }
             cmd.contains("/notifications") || cmd == "notifications" -> {
-                val enabled = androidx.core.app.NotificationManagerCompat.getEnabledListenerPackages(this)
-                    .contains(NotificationWatcherService::class.java.packageName)
-                if (enabled) {
-                    sendText(targetChatId, "✅ Monitor notifikasi AKTIF. Semua notifikasi masuk otomatis dikirim ke chat ini.")
-                } else {
-                    sendText(targetChatId, "⚠️ Monitor notifikasi belum diizinkan.\nBuka app → tap \"Izinkan Monitor Notifikasi\" → centang app → kembali. Lalu /notifications lagi.")
-                }
+                sendText(targetChatId, "⚠️ Monitor notifikasi sedang NONAKTIF (dinonaktifkan sementara). Fitur lain tetap jalan: /ping /screenshot /battery /status /gps /photo /help.")
             }
             cmd.contains("/reset") || cmd == "reset" -> {
                 // Debug: reset lastUpdateId + clear di prefs

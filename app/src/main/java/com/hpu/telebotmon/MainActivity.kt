@@ -191,10 +191,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshNotifStatus() {
         val enabled = NotificationWatcherService.isEnabled(this)
-        tvNotifStatus.text = if (enabled) {
-            "✅ Monitor notifikasi AKTIF — semua notifikasi masuk dikirim ke bot"
-        } else {
-            "Status monitor notifikasi: belum diizinkan (tap tombol di atas)"
+        tvNotifStatus.text = "🔔 Monitor notifikasi: NONAKTIF (dinonaktifkan sementara karena crash)"
+        if (enabled) {
+            // Kalau user masih izinkan, kasih tahu fitur ini tidak aktif
+            Log.d(TAG, "Notif reader masih di-allow di system, tapi service-nya di-disable")
         }
     }
 
