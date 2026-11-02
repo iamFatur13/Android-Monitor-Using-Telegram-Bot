@@ -322,6 +322,15 @@ class TelegramService : Service() {
                 }
                 sendText(targetChatId, sb.toString())
             }
+            cmd.contains("/crash") || cmd == "crash" -> {
+                val app = applicationContext as? App
+                val crashLog = app?.getLatestCrashLog()
+                if (crashLog == null) {
+                    sendText(targetChatId, "Tidak ada crash log. App belum pernah crash.")
+                } else {
+                    sendText(targetChatId, "LAST CRASH:\n" + crashLog)
+                }
+            }
             else -> {
                 sendText(targetChatId, "Perintah tidak dikenal. Ketik /help untuk bantuan.")
             }

@@ -38,34 +38,46 @@ class NotificationWatcherService : NotificationListenerService() {
     }
 
     override fun onDestroy() {
-        scope.cancel()
-        http.dispatcher.executorService.shutdown()
+        try {
+            scope.cancel()
+            http.dispatcher.executorService.shutdownNow()
+        } catch (e: Exception) {
+            Log.w(TAG, "onDestroy cleanup: ${e.message}")
+        }
         super.onDestroy()
     }
 
     /** Dipanggil saat user pertama kali centang app di Notification access. */
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
-        if (sbn == null) return
-        // Muat ulang token/chatId dari prefs — user mungkin baru isinya setelah monitor aktif
-        loadTokenAndChat()
-        val extras = sbn.notification.extras
-        val pkg = sbn.packageName ?: "unknown"
-        val title = extras.getCharSequence(android.app.Notification.EXTRA_TITLE)?.toString() ?: ""
-        val text = extras.getCharSequence(android.app.Notification.EXTRA_TEXT)?.toString() ?: ""
-        val time = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
-            .format(java.util.Date())
-        Log.d(TAG, "onNotificationPosted: [$time] $pkg | $title | $text")
-        if (botToken.isEmpty() || botChatId.isEmpty()) {
-            Log.w(TAG, "skip: token/chatId belum diisi di app")
-            return
+        // Seluruh body di-wrap try/catch: tidak boleh ada notifikasi
+        // yang crash service (yang akan membuat app force-close).
+        try {
+            if (sbn == null) return
+            // Muat ulang token/chatId dari prefs — user mungkin baru isinya setelah monitor aktif
+            loadTokenAndChat()
+            val extras = sbn.notification.extras
+            val pkg = sbn.packageName ?: "unknown"
+            // Beberapa notifikasi tidak punya EXTRA_TITLE/EXTRA_TEXT
+            val title = extras.getCharSequence(android.app.Notification.EXTRA_TITLE)?.toString() ?: ""
+            val text = extras.getCharSequence(android.app.Notification.EXTRA_TEXT)?.toString() ?: ""
+            val time = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
+                .format(java.util.Date())
+            Log.d(TAG, "onNotificationPosted: [$time] $pkg | $title | $text")
+            if (botToken.isEmpty() || botChatId.isEmpty()) {
+                Log.w(TAG, "skip: token/chatId belum diisi di app")
+                return
+            }
+            val msg = buildString {
+                append("🔔 [").append(time).append("] ").append(pkg.replace("com.", ""))
+                if (title.isNotEmpty()) append("\nJudul: ").append(title)
+                if (text.isNotEmpty()) append("\nTeks: ").append(text)
+                append("\nApp: ").append(pkg)
+            }
+            sendToBot(msg)
+        } catch (e: Exception) {
+            // Jangan biarkan crash menyebar — log & lanjut
+            Log.e(TAG, "onNotificationPosted crash (caught): ${e.javaClass.simpleName}: ${e.message}")
         }
-        val msg = buildString {
-            append("🔔 [").append(time).append("] ").append(pkg.replace("com.", ""))
-            if (title.isNotEmpty()) append("\nJudul: ").append(title)
-            if (text.isNotEmpty()) append("\nTeks: ").append(text)
-            append("\nApp: ").append(pkg)
-        }
-        sendToBot(msg)
     }
 
     private fun loadTokenAndChat() {
