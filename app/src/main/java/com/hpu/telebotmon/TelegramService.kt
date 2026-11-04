@@ -190,6 +190,43 @@ class TelegramService : Service() {
         startForeground(1, note)
     }
 
+    /** Tampilkan foreground notification khusus recording — memberi "visible surface"
+     *  sah ke MIUI agar mic access tidak di-blokir saat app di-background. */
+    private fun showRecordingNotification() {
+        val ch = "telebot_recording"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel(ch, "Rekaman TeleBot", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+        val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val note = NotificationCompat.Builder(this, ch)
+            .setContentTitle("⏺️ Sedang merekam audio...")
+            .setContentText("Rekaman 15 detik akan dikirim ke Telegram")
+            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .setContentIntent(pi)
+            .setOngoing(true)
+            .build()
+        startForeground(2, note)
+        Log.d(TAG, "showRecordingNotification: started")
+    }
+
+    /** Hapus notification recording setelah selesai. */
+    private fun hideRecordingNotification() {
+        try {
+            if (Build.VERSION.SDK_INT >= 31) {
+                @Suppress("DEPRECATION")
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+            Log.d(TAG, "hideRecordingNotification: removed")
+        } catch (e: Exception) {
+            Log.w(TAG, "hideRecordingNotification: ${e.message}")
+        }
+    }
+
     private fun startPolling() {
         if (isPolling) {
             Log.d(TAG, "startPolling: already running, skip duplicate")
@@ -595,17 +632,19 @@ class TelegramService : Service() {
             }
         }
         isRecording = true
+        showRecordingNotification()
         sendText(chatId, "⏺️ Mulai rekam 15 detik... (layar sebaiknya ON)")
         Log.d(TAG, "recordAudio: launching AudioRecorderActivity for chat=$chatId")
         try {
             val i = Intent(this, AudioRecorderActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                 putExtra(AudioRecorderActivity.EXTRA_CHAT_ID, chatId)
             }
             startActivity(i)
         } catch (e: Exception) {
             Log.e(TAG, "recordAudio: startActivity fail: ${e.message}")
             isRecording = false
+            hideRecordingNotification()
             scope?.launch { sendText(chatId, "❌ Gagal launching activity rekaman: ${e.message}") }
         }
     }
@@ -619,6 +658,7 @@ class TelegramService : Service() {
                     val path = intent.getStringExtra(AudioRecorderActivity.EXTRA_FILE) ?: ""
                     val file = java.io.File(path)
                     isRecording = false
+                    hideRecordingNotification()
                     if (file.exists() && file.length() > 0) {
                         Log.d(TAG, "recordResult: done, ${file.length()} bytes")
                         scope?.launch {
@@ -633,6 +673,7 @@ class TelegramService : Service() {
                 AudioRecorderActivity.ACTION_FAIL -> {
                     val err = intent.getStringExtra(AudioRecorderActivity.EXTRA_ERROR) ?: "unknown"
                     isRecording = false
+                    hideRecordingNotification()
                     Log.w(TAG, "recordResult: fail: $err")
                     scope?.launch { sendText(chatId, "❌ Rekaman gagal: $err") }
                 }
