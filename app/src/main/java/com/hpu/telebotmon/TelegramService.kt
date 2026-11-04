@@ -211,17 +211,13 @@ class TelegramService : Service() {
         Log.d(TAG, "showRecordingNotification: started")
     }
 
-    /** Hapus notification recording setelah selesai. */
+    /** Hapus notification recording (id=2) TANPA mematikan foreground state service.
+     *  PENTING: jangan pakai stopForeground() — itu membunuh foreground
+     *  service-nya juga, dan MIUI kemudian kill service-nya. */
     private fun hideRecordingNotification() {
         try {
-            if (Build.VERSION.SDK_INT >= 31) {
-                @Suppress("DEPRECATION")
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            } else {
-                @Suppress("DEPRECATION")
-                stopForeground(true)
-            }
-            Log.d(TAG, "hideRecordingNotification: removed")
+            getSystemService(NotificationManager::class.java).cancel(2)
+            Log.d(TAG, "hideRecordingNotification: cancelled id=2")
         } catch (e: Exception) {
             Log.w(TAG, "hideRecordingNotification: ${e.message}")
         }
