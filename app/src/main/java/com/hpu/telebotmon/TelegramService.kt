@@ -1107,20 +1107,9 @@ class TelegramService : Service() {
         if (cameraId == null) return Pair(null, "no_camera_facing=$facing")
         Log.d(TAG, "recordOneVideo: Camera2 cameraId=$cameraId facing=$facing")
 
-        // Pilih resolusi dari characteristics
-        var vw = 1280; var vh = 720
-        try {
-            val chars = cm.getCameraCharacteristics(cameraId)
-            val map = chars.get(android.hardware.camera2.CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            val yuvSizes = map?.getOutputSizes(android.graphics.ImageFormat.YUV_420_888) ?: emptyArray()
-            Log.d(TAG, "recordOneVideo: YUV sizes=" + yuvSizes.map { "${it.width}x${it.height}" })
-            val best = yuvSizes.filter { it.width >= 640 && it.height >= 480 }
-                .maxByOrNull { it.width.toLong() * it.height.toLong() }
-            if (best != null) { vw = best.width; vh = best.height }
-        } catch (e: Exception) {
-            Log.w(TAG, "recordOneVideo: size fallback to 1280x720: ${e.message}")
-        }
-        Log.d(TAG, "recordOneVideo: using ${vw}x${vh}")
+        // Gunakan 640x480 — resolusi universal yang 100% didukung semua H264 encoder
+        val vw = 640; val vh = 480
+        Log.d(TAG, "recordOneVideo: using fixed 640x480")
 
         // --- 1. ImageReader untuk frame kamera (YUV) ---
         val reader = android.media.ImageReader.newInstance(vw, vh, android.graphics.ImageFormat.YUV_420_888, 4)
@@ -1137,11 +1126,6 @@ class TelegramService : Service() {
         val encoder = android.media.MediaCodec.createEncoderByType(codecMime)
         encoder.configure(format, null, null, android.media.MediaCodec.CONFIGURE_FLAG_ENCODE)
 
-        // Array input/output buffers (non-null)
-        val inputBuffers = encoder.inputBuffers
-        val outputBuffers = encoder.outputBuffers
-        if (inputBuffers == null || outputBuffers == null)
-            return Pair(null, "encoder_buffers_null")
         val muxer = android.media.MediaMuxer(outFile.absolutePath, android.media.MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         var muxerStarted = false
         var trackIndex = -1
@@ -1212,23 +1196,30 @@ class TelegramService : Service() {
         }
 
         // --- 4. Start codec + muxer ---
+        var inputBuffers: Array<java.nio.ByteBuffer>
+        var outputBuffers: Array<java.nio.ByteBuffer>
         try {
             encoder.start()
             val outFmt = encoder.outputFormat
             if (outFmt == null)
                 return Pair(null, "codec_output_format_null_after_start")
+            // Buffer array baru valid setelah encoder.start()
+            inputBuffers = encoder.inputBuffers
+                ?: return Pair(null, "encoder_input_buffers_null_after_start")
+            outputBuffers = encoder.outputBuffers
+                ?: return Pair(null, "encoder_output_buffers_null_after_start")
             muxer.start()
             muxerStarted = true
             trackIndex = muxer.addTrack(outFmt)
             Log.d(TAG, "recordOneVideo: codec started, muxer track=$trackIndex")
         } catch (e: Exception) {
-            Log.e(TAG, "recordOneVideo: codec/muxer start fail: ${e.message}")
+            Log.e(TAG, "recordOneVideo: codec/muxer start fail: ${e.javaClass.simpleName}: ${e.message}")
             try { camSession?.close() } catch (_: Exception) {}
             try { camDevice?.close() } catch (_: Exception) {}
             try { encoder.release() } catch (_: Exception) {}
             try { muxer.release() } catch (_: Exception) {}
             try { reader.close() } catch (_: Exception) {}
-            return Pair(null, "codec_start_fail: ${e.message}")
+            return Pair(null, "codec_start_fail: ${e.javaClass.simpleName}: ${e.message}")
         }
 
         // --- 5. Loop: baca frame dari ImageReader → encoder → muxer ---
