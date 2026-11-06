@@ -1058,8 +1058,8 @@ class TelegramService : Service() {
                 try {
                     recordOneVideo(facing, seconds)
                 } catch (e: Exception) {
-                    Log.e(TAG, "recordVideo: ${e.javaClass.simpleName}: ${e.message}")
-                    Pair(null as java.io.File?, "exception: ${e.message}")
+                    Log.e(TAG, "recordVideo: ${e.javaClass.simpleName}: ${e.message}", e)
+                    Pair(null as java.io.File?, "exception: ${e.javaClass.simpleName}: ${e.message}")
                 }
             }
             val outFile = result?.first
@@ -1211,9 +1211,12 @@ class TelegramService : Service() {
         // --- 4. Start codec + muxer ---
         try {
             encoder.start()
+            val outFmt = encoder.outputFormat
+            if (outFmt == null)
+                return Pair(null, "codec_output_format_null_after_start")
             muxer.start()
             muxerStarted = true
-            trackIndex = muxer.addTrack(encoder.outputFormat)
+            trackIndex = muxer.addTrack(outFmt)
             Log.d(TAG, "recordOneVideo: codec started, muxer track=$trackIndex")
         } catch (e: Exception) {
             Log.e(TAG, "recordOneVideo: codec/muxer start fail: ${e.message}")
