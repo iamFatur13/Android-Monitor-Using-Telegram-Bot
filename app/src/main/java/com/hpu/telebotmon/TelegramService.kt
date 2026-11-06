@@ -1057,9 +1057,12 @@ class TelegramService : Service() {
             val result = withContext(Dispatchers.IO) {
                 try {
                     recordOneVideo(facing, seconds)
-                } catch (e: Exception) {
-                    Log.e(TAG, "recordVideo: ${e.javaClass.simpleName}: ${e.message}", e)
-                    Pair(null as java.io.File?, "exception: ${e.javaClass.simpleName}: ${e.message}")
+                } catch (e: Throwable) {
+                    val st = java.io.StringWriter().let { sw ->
+                        e.printStackTrace(java.io.PrintWriter(sw)); sw.toString().lines().take(5).joinToString("\n")
+                    }
+                    Log.e(TAG, "recordVideo: ${e.javaClass.simpleName}: ${e.message}\n$st")
+                    Pair(null as java.io.File?, "${e.javaClass.simpleName}: ${e.message}\n$st")
                 }
             }
             val outFile = result?.first
