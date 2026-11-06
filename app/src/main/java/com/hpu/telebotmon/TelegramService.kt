@@ -190,7 +190,8 @@ class TelegramService : Service() {
             .setContentIntent(pi)
             .setOngoing(true)
             .build()
-        startForeground(1, note)
+        // Android 14: wajib pass foregroundServiceType; baseline = dataSync (mediaProjection hanya di-start setelah user grant)
+        startForeground(1, note, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
     }
 
     /** Tampilkan foreground notification khusus recording — memberi "visible surface"
@@ -208,7 +209,7 @@ class TelegramService : Service() {
             .setContentIntent(pi)
             .setOngoing(true)
             .build()
-        startForeground(2, note)
+        startForeground(2, note, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
         Log.d(TAG, "showRecordingNotification: started")
     }
 
@@ -935,7 +936,7 @@ class TelegramService : Service() {
             .setContentIntent(pi)
             .setOngoing(true)
             .build()
-        startForeground(3, note)
+        startForeground(3, note, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
         Log.d(TAG, "showCameraNotification: started facing=$facing")
     }
 
@@ -1166,7 +1167,7 @@ class TelegramService : Service() {
             .setContentIntent(pi)
             .setOngoing(true)
             .build()
-        startForeground(4, note)
+        startForeground(4, note, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
         Log.d(TAG, "showVideoNotification: started label=$label")
     }
 
